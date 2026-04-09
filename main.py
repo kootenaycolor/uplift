@@ -34,6 +34,8 @@ from googleapiclient.errors import HttpError
 
 import config
 import drive as drivelib
+import drive_accounts
+from drive import StopRequested
 from state import StateManager, UploadEntry
 
 # ── Appearance ────────────────────────────────────────────────────────────────
@@ -56,7 +58,9 @@ FONT_TITLE = ("SF Pro Display", 20, "bold")
 FONT_LABEL = ("SF Pro Text", 11)
 FONT_SMALL = ("SF Pro Text", 10)
 
-MAX_CONCURRENT = 3  # max simultaneous upload workers
+MAX_CONCURRENT = 1  # serialized — OpenSSL 3.x has a thread-safety bug that
+                     # macOS 26's xzone malloc allocator catches as heap corruption
+                     # when multiple SSL connections operate concurrently
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -321,13 +325,14 @@ class UploadWorker:
     MAX_RETRIES = 5
     RETRY_STATUS_CODES = {429, 500, 502, 503}
 
-    def __init__(self, service, entry: UploadEntry, state: StateManager,
-                 pq: queue.Queue, stop_event: threading.Event):
-        self._service = service
+    def __init__(self, entry: UploadEntry, state: StateManager,
+                 pq: queue.Queue, stop_event: threading.Event,
+                 account_id: str = ""):
         self._entry = entry
         self._state = state
         self._pq = pq
         self._stop = stop_event
+        self._account_id = account_id
 
     def run(self):
         entry_id = self._entry.id
@@ -335,15 +340,25 @@ class UploadWorker:
         wrapper = None
 
         try:
+            # Each worker gets its own Drive service with an independent HTTP
+            # connection.  httplib2 is NOT thread-safe — sharing a single
+            # service across concurrent workers corrupts OpenSSL buffers,
+            # which macOS 26's xzone malloc allocator detects as a crash.
+            if self._account_id and drive_accounts.token_path(self._account_id).exists():
+                service = drive_accounts.build_thread_service(self._account_id)
+            else:
+                service = drivelib.build_thread_service()
+
             if self._entry.resumable_uri:
                 # Resume an existing session
                 request, wrapper, confirmed = drivelib.restore_upload_request(
-                    self._service,
+                    service,
                     self._entry.local_path,
                     self._entry.folder_id,
                     self._entry.resumable_uri,
                     self._entry.resumable_progress,
                     lambda b: self._pq.put(("progress", entry_id, b)),
+                    stop_event=self._stop,
                 )
                 self._state.update(entry_id, status="in_progress",
                                    resumable_progress=confirmed)
@@ -351,10 +366,11 @@ class UploadWorker:
             else:
                 # Start a fresh session
                 request, wrapper = drivelib.create_upload_request(
-                    self._service,
+                    service,
                     self._entry.local_path,
                     self._entry.folder_id,
                     lambda b: self._pq.put(("progress", entry_id, b)),
+                    stop_event=self._stop,
                 )
                 now = datetime.now(timezone.utc).isoformat()
                 self._state.update(entry_id, status="in_progress",
@@ -364,14 +380,6 @@ class UploadWorker:
             retry_count = 0
 
             while response is None:
-                if self._stop.is_set():
-                    # Save session so user can resume later
-                    self._state.update(entry_id, status="queued",
-                                       resumable_uri=request.resumable_uri or self._entry.resumable_uri,
-                                       resumable_progress=request.resumable_progress or 0)
-                    self._pq.put(("cancelled", entry_id, None))
-                    return
-
                 try:
                     status, response = request.next_chunk()
                     retry_count = 0  # reset on success
@@ -382,6 +390,16 @@ class UploadWorker:
                                            resumable_uri=request.resumable_uri,
                                            resumable_progress=confirmed_bytes)
                         self._pq.put(("confirmed", entry_id, confirmed_bytes))
+
+                except StopRequested:
+                    # User clicked pause — save session and exit cleanly
+                    saved_uri = (request.resumable_uri if request else None) or self._entry.resumable_uri
+                    saved_progress = (request.resumable_progress if request else None) or 0
+                    self._state.update(entry_id, status="queued",
+                                       resumable_uri=saved_uri,
+                                       resumable_progress=saved_progress)
+                    self._pq.put(("cancelled", entry_id, None))
+                    return
 
                 except (ConnectionError, TimeoutError, BrokenPipeError,
                         socket.timeout, socket.error) as e:
@@ -410,6 +428,13 @@ class UploadWorker:
                                resumable_uri=None,
                                resumable_progress=self._entry.file_size)
             self._pq.put(("done", entry_id, drive_file_id))
+
+        except StopRequested:
+            # Stop was set before the first chunk even started
+            self._state.update(entry_id, status="queued",
+                               resumable_uri=self._entry.resumable_uri,
+                               resumable_progress=self._entry.resumable_progress)
+            self._pq.put(("cancelled", entry_id, None))
 
         except OSError as e:
             msg = str(e)
@@ -489,7 +514,7 @@ class ZipWorker:
 class UploadRowFrame(ctk.CTkFrame):
     """One row in the upload queue. Shows progress, stats, and a cancel button."""
 
-    def __init__(self, parent, entry: UploadEntry, cancel_callback):
+    def __init__(self, parent, entry: UploadEntry, cancel_callback, resume_callback=None):
         super().__init__(parent, fg_color=BG2, corner_radius=8,
                          border_color=BORDER, border_width=1)
         self._entry_id = entry.id
@@ -499,6 +524,7 @@ class UploadRowFrame(ctk.CTkFrame):
         self._rate_samples: deque = deque()
         self._rate = 0.0
         self._cancel_callback = cancel_callback
+        self._resume_callback = resume_callback
 
         self.pack(fill="x", padx=0, pady=3)
 
@@ -614,6 +640,46 @@ class UploadRowFrame(ctk.CTkFrame):
         self._stats.configure(text=f"{_fmt_size(self._file_size)} uploaded successfully",
                               text_color=GREEN)
 
+    def set_paused(self):
+        """Upload was stopped by user. Show resume button."""
+        self._rate_samples.clear()
+        self._rate = 0.0
+        self._set_badge("Paused", BG3, TEXT2)
+        done = _fmt_size(self._bytes_confirmed)
+        total = _fmt_size(self._file_size)
+        pct = int(self._bytes_confirmed / self._file_size * 100) if self._file_size else 0
+        self._stats.configure(text=f"Paused at {done} / {total} ({pct}%)", text_color=TEXT2)
+        # Switch cancel button to a resume button
+        self._cancel_btn.configure(
+            text="▶", fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+            state="normal",
+            command=lambda: self._resume_callback(self._entry_id) if self._resume_callback else None,
+        )
+
+    def set_queued(self):
+        """Reset to queued state (e.g. after pausing and re-queueing)."""
+        self._rate_samples.clear()
+        self._rate = 0.0
+        self._set_badge("Queued", BG3, TEXT2)
+        self._stats.configure(text="Waiting to upload…", text_color=TEXT2)
+        self._cancel_btn.configure(
+            text="✕", fg_color=BG3, hover_color=RED, text_color=TEXT2,
+            state="normal",
+            command=lambda: self._cancel_callback(self._entry_id),
+        )
+
+    def set_uploading(self):
+        """Called when a worker actually starts (or resumes) this entry."""
+        self._rate_samples.clear()
+        self._rate = 0.0
+        self._set_badge("Uploading", ACCENT, TEXT)
+        # Restore cancel button (may have been a resume ▶ button)
+        self._cancel_btn.configure(
+            text="✕", fg_color=BG3, hover_color=RED, text_color=TEXT2,
+            state="normal",
+            command=lambda: self._cancel_callback(self._entry_id),
+        )
+
     def set_failed(self, msg: str):
         self._set_badge("Failed", RED, TEXT)
         self._cancel_btn.configure(state="disabled")
@@ -683,8 +749,8 @@ class UploadQueueFrame(ctk.CTkScrollableFrame):
             header = FolderGroupRow(self, group_name, n_total)
             self._group_headers[group_id] = header
 
-    def add_row(self, entry: UploadEntry, cancel_callback) -> UploadRowFrame:
-        row = UploadRowFrame(self, entry, cancel_callback)
+    def add_row(self, entry: UploadEntry, cancel_callback, resume_callback=None) -> UploadRowFrame:
+        row = UploadRowFrame(self, entry, cancel_callback, resume_callback)
         self._rows[entry.id] = row
         return row
 
@@ -702,6 +768,183 @@ class UploadQueueFrame(ctk.CTkScrollableFrame):
                 row.pack_forget()
                 row.destroy()
                 del self._rows[entry_id]
+
+
+# ── Drive Accounts Dialog ────────────────────────────────────────────────────
+
+class DriveAccountsDialog(ctk.CTkToplevel):
+    """Manage saved Google Drive accounts and choose which one is active."""
+
+    def __init__(self, parent, cfg: dict):
+        super().__init__(parent)
+        self.title("Google Drive Accounts")
+        self.geometry("500x400")
+        self.configure(fg_color=BG)
+        self.resizable(False, True)
+        self.grab_set()
+        self._cfg = cfg
+        self.account_changed = False
+
+        ctk.CTkLabel(self, text="Google Drive Accounts",
+                     font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 4))
+        ctk.CTkLabel(self, text="Manage which account this app uploads to.",
+                     font=FONT_LABEL, text_color=TEXT2).pack(padx=20, pady=(0, 12))
+
+        self._list_frame = ctk.CTkScrollableFrame(self, fg_color=BG2, corner_radius=10,
+                                                   border_color=BORDER, border_width=1)
+        self._list_frame.pack(fill="both", expand=True, padx=20)
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(10, 16))
+        ctk.CTkButton(btn_row, text="+ Add Account", height=34, corner_radius=8,
+                      fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+                      command=self._add_account).pack(side="left")
+        ctk.CTkButton(btn_row, text="Done", width=80, height=34, corner_radius=8,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self.destroy).pack(side="right")
+
+        self._rebuild_list()
+
+    def _rebuild_list(self):
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+        accounts = drive_accounts.list_accounts()
+        active_id = self._cfg.get("active_drive_account_id", "")
+        if not accounts:
+            ctk.CTkLabel(self._list_frame,
+                         text="No accounts saved yet. Click + Add Account.",
+                         font=FONT_LABEL, text_color=TEXT2).pack(padx=16, pady=20)
+            return
+        for acct in accounts:
+            row = ctk.CTkFrame(self._list_frame, fg_color=BG3, corner_radius=8)
+            row.pack(fill="x", padx=8, pady=(4, 0))
+            row.columnconfigure(1, weight=1)
+
+            is_active = acct["id"] == active_id
+            dot = "●" if is_active else "○"
+            dot_color = ACCENT if is_active else TEXT2
+            ctk.CTkLabel(row, text=dot, font=FONT_LABEL,
+                         text_color=dot_color, width=20).grid(row=0, column=0, padx=(10, 6), pady=10)
+
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.grid(row=0, column=1, sticky="ew", pady=6)
+            ctk.CTkLabel(info, text=acct["name"], font=("SF Pro Text", 12, "bold"),
+                         text_color=TEXT, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(info, text=acct["email"], font=FONT_SMALL,
+                         text_color=TEXT2, anchor="w").pack(anchor="w")
+
+            btns = ctk.CTkFrame(row, fg_color="transparent")
+            btns.grid(row=0, column=2, padx=(0, 10), pady=10)
+            if is_active:
+                ctk.CTkLabel(btns, text="Active", font=FONT_SMALL,
+                             text_color=ACCENT).pack(side="left", padx=(0, 8))
+            else:
+                acct_id = acct["id"]
+                ctk.CTkButton(btns, text="Use", width=52, height=28, corner_radius=6,
+                              fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+                              command=lambda aid=acct_id: self._set_active(aid)
+                              ).pack(side="left", padx=(0, 6))
+            acct_id = acct["id"]
+            ctk.CTkButton(btns, text="✕", width=28, height=28, corner_radius=6,
+                          fg_color=BG2, hover_color=RED, text_color=TEXT2,
+                          command=lambda aid=acct_id: self._remove(aid)
+                          ).pack(side="left")
+
+    def _set_active(self, account_id: str):
+        self._cfg["active_drive_account_id"] = account_id
+        self.account_changed = True
+        self._rebuild_list()
+
+    def _remove(self, account_id: str):
+        drive_accounts.remove_account(account_id)
+        if self._cfg.get("active_drive_account_id") == account_id:
+            self._cfg["active_drive_account_id"] = ""
+            self.account_changed = True
+        self._rebuild_list()
+
+    def _add_account(self):
+        dlg = AddAccountDialog(self)
+        self.wait_window(dlg)
+        if dlg.result:
+            self._cfg["active_drive_account_id"] = dlg.result["id"]
+            self.account_changed = True
+            self._rebuild_list()
+
+
+class AddAccountDialog(ctk.CTkToplevel):
+    """Prompt for an optional account name, credentials file, then run the OAuth flow."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Add Google Account")
+        self.geometry("400x265")
+        self.configure(fg_color=BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.result = None
+        self._creds_path: str = ""
+
+        ctk.CTkLabel(self, text="Add Google Drive Account",
+                     font=("SF Pro Text", 14, "bold"), text_color=TEXT).pack(padx=20, pady=(20, 4))
+        ctk.CTkLabel(self, text="A browser window will open for Google sign-in.",
+                     font=FONT_LABEL, text_color=TEXT2).pack(padx=20, pady=(0, 12))
+
+        form = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
+                            border_color=BORDER, border_width=1)
+        form.pack(fill="x", padx=20)
+        form.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Nickname", font=FONT_LABEL,
+                     text_color=TEXT2, anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(12, 6), sticky="w")
+        self._name_var = ctk.StringVar()
+        ctk.CTkEntry(form, textvariable=self._name_var, placeholder_text="e.g. Personal, Work (optional)",
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=32, corner_radius=6).grid(row=0, column=1, columnspan=2, padx=(0, 14), pady=(12, 6), sticky="ew")
+
+        ctk.CTkLabel(form, text="Credentials File", font=FONT_LABEL,
+                     text_color=TEXT2, anchor="w").grid(row=1, column=0, padx=(14, 8), pady=(6, 12), sticky="w")
+        self._creds_label = ctk.CTkLabel(form, text="— not selected —",
+                                          font=FONT_SMALL, text_color=TEXT2, anchor="w")
+        self._creds_label.grid(row=1, column=1, padx=(0, 6), pady=(6, 12), sticky="ew")
+        ctk.CTkButton(form, text="Browse…", width=70, height=28, corner_radius=6,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self._browse_credentials).grid(row=1, column=2, padx=(0, 14), pady=(6, 12))
+
+        self._status = ctk.CTkLabel(self, text="", font=FONT_SMALL, text_color=TEXT2)
+        self._status.pack(pady=(8, 0))
+
+        self._connect_btn = ctk.CTkButton(self, text="Connect Google Account",
+                                           height=36, corner_radius=8,
+                                           fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+                                           font=("SF Pro Text", 12, "bold"),
+                                           state="disabled",
+                                           command=self._connect)
+        self._connect_btn.pack(padx=20, pady=(8, 16), fill="x")
+
+    def _browse_credentials(self):
+        path = filedialog.askopenfilename(
+            title="Select credentials.json",
+            filetypes=[("JSON", "*.json"), ("All files", "*")],
+        )
+        if path:
+            self._creds_path = path
+            self._creds_label.configure(text=Path(path).name, text_color=TEXT)
+            self._connect_btn.configure(state="normal")
+
+    def _connect(self):
+        self._connect_btn.configure(state="disabled", text="Connecting…")
+        self._status.configure(text="Browser opening for Google sign-in…")
+        name = self._name_var.get().strip()
+        threading.Thread(target=self._do_oauth, args=(name,), daemon=True).start()
+
+    def _do_oauth(self, name: str):
+        try:
+            acct = drive_accounts.add_account(self._creds_path, display_name=name)
+            self.result = acct
+            self.after(0, self.destroy)
+        except Exception as e:
+            self.after(0, lambda: self._connect_btn.configure(state="normal", text="Connect Google Account"))
+            self.after(0, lambda: self._status.configure(text=f"Error: {e}", text_color=RED))
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -722,6 +965,7 @@ class App(ctk.CTk):
         self._active_workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
 
         self._build_ui()
+        self._update_account_label()
         self._handle_startup_state()
         self._poll_progress()
 
@@ -751,16 +995,28 @@ class App(ctk.CTk):
         card.pack(fill="x", padx=24)
         card.columnconfigure(1, weight=1)
 
+        # Google Account row
+        ctk.CTkLabel(card, text="Google Account", font=FONT_LABEL,
+                     text_color=TEXT2, anchor="w").grid(
+                         row=0, column=0, padx=(16, 8), pady=(14, 6), sticky="w")
+        self._account_label = ctk.CTkLabel(card, text="— none selected —",
+                                            font=FONT_LABEL, text_color=TEXT2, anchor="w")
+        self._account_label.grid(row=0, column=1, padx=(0, 8), pady=(14, 6), sticky="ew")
+        ctk.CTkButton(card, text="Manage", width=80, height=30, corner_radius=6,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self._manage_accounts).grid(row=0, column=2, padx=(0, 16), pady=(14, 6))
+
+        # Drive Folder row
         ctk.CTkLabel(card, text="Drive Folder", font=FONT_LABEL,
                      text_color=TEXT2, anchor="w").grid(
-                         row=0, column=0, padx=(16, 8), pady=14, sticky="w")
+                         row=1, column=0, padx=(16, 8), pady=(6, 14), sticky="w")
         self._folder_var = ctk.StringVar(value="— loading… —")
         ctk.CTkLabel(card, textvariable=self._folder_var, font=FONT_LABEL,
                      text_color=TEXT, anchor="w").grid(
-                         row=0, column=1, padx=(0, 8), pady=14, sticky="ew")
+                         row=1, column=1, padx=(0, 8), pady=(6, 14), sticky="ew")
 
         btn_col = ctk.CTkFrame(card, fg_color="transparent")
-        btn_col.grid(row=0, column=2, padx=(0, 16), pady=14)
+        btn_col.grid(row=1, column=2, padx=(0, 16), pady=(6, 14))
         ctk.CTkButton(btn_col, text="Pick", width=54, height=30, corner_radius=6,
                       fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
                       command=self._pick_drive_folder).pack(side="left", padx=(0, 4))
@@ -817,7 +1073,7 @@ class App(ctk.CTk):
                 self._queue_frame.add_group_header(
                     entry.group_id, entry.group_name or "Folder",
                     len(group_entries))
-            self._queue_frame.add_row(entry, self._cancel_upload)
+            self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
 
         # Ask user whether to resume
         self._show_resume_dialog(len(pending))
@@ -881,7 +1137,11 @@ class App(ctk.CTk):
     def _init_drive(self):
         self.after(0, lambda: self._status_dot.configure(text="● Connecting", text_color=YELLOW))
         try:
-            self._drive_service = drivelib.get_service()
+            account_id = self._cfg.get("active_drive_account_id", "")
+            if account_id and drive_accounts.token_path(account_id).exists():
+                self._drive_service = drive_accounts.get_service(account_id)
+            else:
+                self._drive_service = drivelib.get_service()
             self._folders = drivelib.list_folders(self._drive_service)
             self.after(0, lambda: self._status_dot.configure(
                 text=f"● Online ({len(self._folders)} folders)", text_color=GREEN))
@@ -900,6 +1160,26 @@ class App(ctk.CTk):
             self.after(0, lambda: self._status_dot.configure(
                 text="● Connection failed", text_color=RED))
             self.after(0, lambda: self._folder_var.set("⚠ connection failed"))
+
+    # ── Drive account management ──────────────────────────────────────────
+
+    def _update_account_label(self):
+        account_id = self._cfg.get("active_drive_account_id", "")
+        if account_id:
+            acct = drive_accounts.get_account(account_id)
+            if acct:
+                self._account_label.configure(
+                    text=f"{acct['name']}  ·  {acct['email']}", text_color=TEXT)
+                return
+        self._account_label.configure(text="— none selected —", text_color=TEXT2)
+
+    def _manage_accounts(self):
+        dlg = DriveAccountsDialog(self, self._cfg)
+        self.wait_window(dlg)
+        if dlg.account_changed:
+            config.save(self._cfg)
+            self._update_account_label()
+            threading.Thread(target=self._init_drive, daemon=True).start()
 
     # ── Folder picker ─────────────────────────────────────────────────────
 
@@ -937,7 +1217,7 @@ class App(ctk.CTk):
                 continue
             entry = UploadEntry.new(path, size, folder_id, folder_name)
             if self._state.add(entry):
-                self._queue_frame.add_row(entry, self._cancel_upload)
+                self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
                 added += 1
         if added:
             self._start_next_uploads()
@@ -979,7 +1259,7 @@ class App(ctk.CTk):
         )
         entry.file_name = folder_name + ".zip"
         self._state.add(entry)
-        row = self._queue_frame.add_row(entry, self._cancel_upload)
+        row = self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
         row.set_zip_progress(0, 1)  # show initial compressing state
 
         worker = ZipWorker(folder_path, entry.id, self._state, self._progress_queue)
@@ -1043,7 +1323,7 @@ class App(ctk.CTk):
                 self._queue_frame.add_group_header(group_id, folder_name, len(entries))
                 for entry in entries:
                     self._state.add(entry)
-                    self._queue_frame.add_row(entry, self._cancel_upload)
+                    self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
                 self._start_next_uploads()
 
             self.after(0, _add_to_ui)
@@ -1067,8 +1347,9 @@ class App(ctk.CTk):
                 continue
             stop_event = threading.Event()
             worker = UploadWorker(
-                self._drive_service, entry, self._state,
+                entry, self._state,
                 self._progress_queue, stop_event,
+                account_id=self._cfg.get("active_drive_account_id", ""),
             )
             t = threading.Thread(target=worker.run, daemon=True)
             self._active_workers[entry.id] = (t, stop_event)
@@ -1078,19 +1359,30 @@ class App(ctk.CTk):
             t.start()
 
     def _set_badge_uploading(self, row: UploadRowFrame):
-        row._set_badge("Uploading", ACCENT, TEXT)
+        row.set_uploading()
 
     def _cancel_upload(self, entry_id: str):
         if entry_id in self._active_workers:
             _, stop_event = self._active_workers[entry_id]
             stop_event.set()
-            # Worker will post "cancelled" — cleanup happens in _poll_progress
+            # Worker catches StopRequested, saves session, posts "cancelled"
         else:
-            # Not active — just mark as failed in state and update row
+            # Queued but not started — mark as failed (nothing to resume)
             self._state.update(entry_id, status="failed", error="Cancelled by user")
             row = self._queue_frame.get_row(entry_id)
             if row:
                 row.set_failed("Cancelled by user")
+
+    def _resume_upload(self, entry_id: str):
+        """Resume a paused upload in the current session."""
+        if entry_id in self._active_workers:
+            return  # already running
+        row = self._queue_frame.get_row(entry_id)
+        if row:
+            # Immediately switch button back to ✕ so user sees the response
+            row.set_uploading()
+        # State is already "queued" with resumable_uri saved — kick the scheduler
+        self._start_next_uploads()
 
     # ── Progress polling ──────────────────────────────────────────────────
 
@@ -1132,9 +1424,7 @@ class App(ctk.CTk):
                     self._active_workers.pop(entry_id, None)
                     row = self._queue_frame.get_row(entry_id)
                     if row:
-                        row._set_badge("Paused", BG3, TEXT2)
-                        row._stats.configure(
-                            text="Upload paused — will resume on next launch")
+                        row.set_paused()
                     self._start_next_uploads()
 
                 elif kind == "zip_progress":

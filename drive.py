@@ -1,4 +1,9 @@
-"""Google Drive API helpers for drive-uploader.
+# ── Shared upload engine ──────────────────────────────────────────────────────
+# This file is intentionally kept in sync with drive-uploader/drive.py.
+# When making changes, update both copies.
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""Google Drive API helpers for export-watcher.
 
 Handles OAuth, folder listing, and the resumable upload engine with:
   - 25 MB chunks (Frame.io-inspired sizing for fewer round-trips)
@@ -29,29 +34,52 @@ TOKEN_PATH = _HERE / "token.json"
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
-def get_service():
-    """Return an authenticated Drive service. Runs OAuth flow on first use."""
-    creds = None
+def get_service(token_path_override=None, credentials_path_override=None):
+    """Return an authenticated Drive service. Runs OAuth flow on first use.
 
-    if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    Pass token_path_override / credentials_path_override to use a non-default
+    account (e.g. from drive_accounts). Omit both to use the app's own token.json.
+    """
+    _tp = Path(token_path_override) if token_path_override else TOKEN_PATH
+    _cp = Path(credentials_path_override) if credentials_path_override else CREDENTIALS_PATH
+
+    creds = None
+    if _tp.exists():
+        creds = Credentials.from_authorized_user_file(str(_tp), SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not CREDENTIALS_PATH.exists():
+            if not _cp.exists():
                 raise FileNotFoundError(
-                    f"credentials.json not found at {CREDENTIALS_PATH}.\n"
+                    f"credentials.json not found at {_cp}.\n"
                     "Download it from Google Cloud Console → APIs & Services → Credentials."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_PATH), SCOPES
-            )
+            flow = InstalledAppFlow.from_client_secrets_file(str(_cp), SCOPES)
             creds = flow.run_local_server(port=0)
 
-        TOKEN_PATH.write_text(creds.to_json())
+        _tp.write_text(creds.to_json())
 
+    return build("drive", "v3", credentials=creds)
+
+
+def build_thread_service(token_path_override=None):
+    """Return a NEW Drive service with its own HTTP connection.
+
+    Each upload worker thread MUST call this to get an independent service.
+    httplib2's HTTP object is not thread-safe — sharing a single service across
+    concurrent upload threads corrupts OpenSSL's internal buffers, which
+    macOS 26's xzone malloc allocator detects as memory corruption.
+
+    Pass token_path_override to use a non-default account.
+    """
+    _tp = Path(token_path_override) if token_path_override else TOKEN_PATH
+    creds = Credentials.from_authorized_user_file(str(_tp), SCOPES)
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            _tp.write_text(creds.to_json())
     return build("drive", "v3", credentials=creds)
 
 
@@ -146,21 +174,44 @@ def list_folders(service):
 
 # ── Progress-tracking file wrapper ────────────────────────────────────────────
 
+class StopRequested(Exception):
+    """Raised from inside ProgressFileWrapper when a stop event is set.
+
+    Propagates out of next_chunk() immediately, interrupting a mid-chunk upload
+    without waiting for the full 25 MB chunk to finish sending.
+    """
+
+
 class ProgressFileWrapper(io.RawIOBase):
     """Wraps a file, intercepting read() calls to report sub-chunk progress.
 
     This decouples UI update frequency from chunk size: even with 25 MB chunks,
     the progress bar moves as bytes are read from disk (which closely tracks
     bytes sent over the network).
+
+    If stop_event is provided, raises StopRequested as soon as it is set,
+    which propagates out of next_chunk() and allows immediate cancellation.
     """
 
-    def __init__(self, file_path: str, progress_callback):
+    def __init__(self, file_path: str, progress_callback, stop_event=None):
         super().__init__()
         self._file = open(file_path, "rb")
         self._bytes_read = 0
         self._callback = progress_callback
+        self._stop_event = stop_event
+
+    # Cap each read so the stop-event check fires at least every 256 KB,
+    # giving sub-second cancellation response even on fast local storage.
+    _READ_CAP = 256 * 1024
+
+    def _check_stop(self):
+        if self._stop_event and self._stop_event.is_set():
+            raise StopRequested()
 
     def read(self, n=-1):
+        self._check_stop()
+        if n < 0 or n > self._READ_CAP:
+            n = self._READ_CAP
         data = self._file.read(n)
         if data:
             self._bytes_read += len(data)
@@ -168,7 +219,10 @@ class ProgressFileWrapper(io.RawIOBase):
         return data
 
     def readinto(self, b):
-        n = self._file.readinto(b)
+        self._check_stop()
+        # Limit how much we fill per call
+        view = memoryview(b)[:self._READ_CAP]
+        n = self._file.readinto(view)
         if n:
             self._bytes_read += n
             self._callback(self._bytes_read)
@@ -198,7 +252,8 @@ class ProgressFileWrapper(io.RawIOBase):
 
 # ── Upload session management ─────────────────────────────────────────────────
 
-def create_upload_request(service, file_path: str, folder_id: str, progress_callback):
+def create_upload_request(service, file_path: str, folder_id: str,
+                          progress_callback, stop_event=None):
     """Create a new resumable upload session. Does not start uploading.
 
     Returns (request, wrapper). Caller drives the upload by calling
@@ -208,7 +263,7 @@ def create_upload_request(service, file_path: str, folder_id: str, progress_call
     mime, _ = mimetypes.guess_type(file_path)
     mime = mime or "application/octet-stream"
 
-    wrapper = ProgressFileWrapper(file_path, progress_callback)
+    wrapper = ProgressFileWrapper(file_path, progress_callback, stop_event=stop_event)
     media = MediaIoBaseUpload(wrapper, mimetype=mime, chunksize=CHUNK_SIZE, resumable=True)
 
     request = service.files().create(
@@ -221,7 +276,8 @@ def create_upload_request(service, file_path: str, folder_id: str, progress_call
 
 
 def restore_upload_request(service, file_path: str, folder_id: str,
-                           resumable_uri: str, saved_progress: int, progress_callback):
+                           resumable_uri: str, saved_progress: int,
+                           progress_callback, stop_event=None):
     """Restore a previously interrupted resumable upload session.
 
     Queries the Drive server for the actual confirmed byte count (handles
@@ -233,7 +289,7 @@ def restore_upload_request(service, file_path: str, folder_id: str,
     mime = mime or "application/octet-stream"
     file_size = os.path.getsize(file_path)
 
-    wrapper = ProgressFileWrapper(file_path, progress_callback)
+    wrapper = ProgressFileWrapper(file_path, progress_callback, stop_event=stop_event)
     media = MediaIoBaseUpload(wrapper, mimetype=mime, chunksize=CHUNK_SIZE, resumable=True)
 
     # Build a new request object with the same parameters
@@ -301,3 +357,22 @@ def create_drive_folder(service, name: str, parent_id: str) -> str:
         fields="id",
     ).execute()
     return result["id"]
+
+
+# ── Sharing ───────────────────────────────────────────────────────────────────
+
+def make_shareable(service, file_id: str) -> str:
+    """Set file to 'anyone with the link can view' and return the shareable URL."""
+    service.permissions().create(
+        fileId=file_id,
+        supportsAllDrives=True,
+        body={"type": "anyone", "role": "reader"},
+    ).execute()
+
+    file_meta = service.files().get(
+        fileId=file_id,
+        supportsAllDrives=True,
+        fields="webViewLink",
+    ).execute()
+
+    return file_meta.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view")

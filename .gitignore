@@ -1,0 +1,15 @@
+# Credentials and tokens — never commit these
+credentials.json
+token.json
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

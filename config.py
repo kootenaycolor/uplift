@@ -12,6 +12,7 @@ CONFIG_PATH = Path.home() / ".drive-uploader-config.json"
 DEFAULTS = {
     "drive_folder_id": "",
     "drive_folder_name": "",
+    "active_drive_account_id": "",
 }
 
 
