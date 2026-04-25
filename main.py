@@ -32,9 +32,14 @@ from tkinter import filedialog
 import customtkinter as ctk
 from googleapiclient.errors import HttpError
 
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
 import config
 import drive as drivelib
 import drive_accounts
+import mailer
+import sender_profile
 from drive import StopRequested
 from state import StateManager, UploadEntry
 
@@ -57,6 +62,8 @@ YELLOW = "#ffd60a"
 FONT_TITLE = ("SF Pro Display", 20, "bold")
 FONT_LABEL = ("SF Pro Text", 11)
 FONT_SMALL = ("SF Pro Text", 10)
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mxf", ".r3d", ".braw", ".mkv", ".avi", ".prores", ".dng"}
 
 MAX_CONCURRENT = 1  # serialized — OpenSSL 3.x has a thread-safety bug that
                      # macOS 26's xzone malloc allocator catches as heap corruption
@@ -308,6 +315,58 @@ class FolderModeDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+# ── Export Watch Handler ──────────────────────────────────────────────────────
+
+class ExportHandler(FileSystemEventHandler):
+    """Watchdog handler: waits for video file size to stabilize, then queues upload."""
+
+    STABLE_SECS = 10
+    POLL_INTERVAL = 2
+
+    def __init__(self, on_ready_callback):
+        super().__init__()
+        self._callback = on_ready_callback
+        self._seen: set[str] = set()
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._try_queue(event.src_path)
+
+    def on_moved(self, event):
+        # DaVinci Resolve writes to a temp file then renames to final name
+        if not event.is_directory:
+            self._try_queue(event.dest_path)
+
+    def _try_queue(self, path: str):
+        if path in self._seen:
+            return
+        ext = Path(path).suffix.lower()
+        if ext not in VIDEO_EXTENSIONS:
+            return
+        self._seen.add(path)
+        threading.Thread(target=self._wait_and_queue, args=(path,), daemon=True).start()
+
+    def _wait_and_queue(self, path: str):
+        """Poll until file size is stable for STABLE_SECS, then invoke callback."""
+        prev_size = -1
+        stable_count = 0
+        needed = self.STABLE_SECS // self.POLL_INTERVAL
+        while True:
+            try:
+                size = Path(path).stat().st_size
+            except OSError:
+                return  # file disappeared
+            if size == prev_size:
+                stable_count += 1
+                if stable_count >= needed:
+                    self._callback(path)
+                    return
+            else:
+                stable_count = 0
+                prev_size = size
+            time.sleep(self.POLL_INTERVAL)
+
+
 # ── Upload Worker ─────────────────────────────────────────────────────────────
 
 class UploadWorker:
@@ -486,8 +545,9 @@ class ZipWorker:
                     all_files.append(os.path.join(root, f))
 
             folder_parent = os.path.dirname(self._folder)
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED,
-                                 compresslevel=6) as zf:
+            # ZIP_STORED: no compression — video files are already compressed so
+            # deflation gains nothing but wastes CPU. Pure I/O, ~10x faster.
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                 for i, fp in enumerate(all_files):
                     arcname = os.path.relpath(fp, folder_parent)
                     zf.write(fp, arcname)
@@ -639,6 +699,11 @@ class UploadRowFrame(ctk.CTkFrame):
                                     fg_color=BG3, hover_color=BG3, text_color=GREEN)
         self._stats.configure(text=f"{_fmt_size(self._file_size)} uploaded successfully",
                               text_color=GREEN)
+
+    def set_pausing(self):
+        """Immediate visual feedback when user clicks cancel — before worker confirms."""
+        self._set_badge("Pausing…", BG3, TEXT2)
+        self._cancel_btn.configure(state="disabled", text="…")
 
     def set_paused(self):
         """Upload was stopped by user. Show resume button."""
@@ -947,6 +1012,171 @@ class AddAccountDialog(ctk.CTkToplevel):
             self.after(0, lambda: self._status.configure(text=f"Error: {e}", text_color=RED))
 
 
+# ── Email Setup Dialog ────────────────────────────────────────────────────────
+
+class EmailSetupDialog(ctk.CTkToplevel):
+    """Collect Gmail sender identity and App Password, save to profile."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Email Setup")
+        self.geometry("420x310")
+        self.configure(fg_color=BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+        self.after(50, self.lift)
+
+        ctk.CTkLabel(self, text="Email Sender Setup",
+                     font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 4))
+        ctk.CTkLabel(self,
+                     text="Uses Gmail SMTP with an App Password\n"
+                          "(requires 2FA — generate at myaccount.google.com/apppasswords).",
+                     font=FONT_LABEL, text_color=TEXT2, justify="center").pack(padx=20, pady=(0, 12))
+
+        form = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
+                            border_color=BORDER, border_width=1)
+        form.pack(fill="x", padx=20)
+        form.columnconfigure(1, weight=1)
+
+        existing = sender_profile.load() or {}
+
+        ctk.CTkLabel(form, text="Name", font=FONT_LABEL, text_color=TEXT2,
+                     anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(12, 6), sticky="w")
+        self._name_var = ctk.StringVar(value=existing.get("sender_name", ""))
+        ctk.CTkEntry(form, textvariable=self._name_var, placeholder_text="Your Name",
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=32, corner_radius=6).grid(
+                         row=0, column=1, padx=(0, 14), pady=(12, 6), sticky="ew")
+
+        ctk.CTkLabel(form, text="Gmail", font=FONT_LABEL, text_color=TEXT2,
+                     anchor="w").grid(row=1, column=0, padx=(14, 8), pady=(6, 6), sticky="w")
+        self._email_var = ctk.StringVar(value=existing.get("sender_email", ""))
+        ctk.CTkEntry(form, textvariable=self._email_var, placeholder_text="you@gmail.com",
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=32, corner_radius=6).grid(
+                         row=1, column=1, padx=(0, 14), pady=(6, 6), sticky="ew")
+
+        ctk.CTkLabel(form, text="App Password", font=FONT_LABEL, text_color=TEXT2,
+                     anchor="w").grid(row=2, column=0, padx=(14, 8), pady=(6, 12), sticky="w")
+        self._pw_var = ctk.StringVar(value=existing.get("gmail_app_password", ""))
+        ctk.CTkEntry(form, textvariable=self._pw_var, show="●",
+                     placeholder_text="xxxx xxxx xxxx xxxx",
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=32, corner_radius=6).grid(
+                         row=2, column=1, padx=(0, 14), pady=(6, 12), sticky="ew")
+
+        self._status = ctk.CTkLabel(self, text="", font=FONT_SMALL, text_color=RED)
+        self._status.pack(pady=(6, 0))
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(padx=20, pady=(8, 16), fill="x")
+
+        if existing:
+            ctk.CTkButton(btn_row, text="Clear", width=80, height=34, corner_radius=8,
+                          fg_color=RED, hover_color="#cc2a20", text_color=TEXT,
+                          command=self._clear).pack(side="left")
+
+        ctk.CTkButton(btn_row, text="Cancel", width=80, height=34, corner_radius=8,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self.destroy).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Save", width=80, height=34, corner_radius=8,
+                      fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+                      command=self._save).pack(side="right")
+
+    def _save(self):
+        name = self._name_var.get().strip()
+        email = self._email_var.get().strip()
+        pw = self._pw_var.get().strip()
+        if not name or not email or not pw:
+            self._status.configure(text="All fields are required.")
+            return
+        sender_profile.save(name, email, pw)
+        self.destroy()
+
+    def _clear(self):
+        sender_profile.clear()
+        self.destroy()
+
+
+# ── Email Template Dialog ─────────────────────────────────────────────────────
+
+class EmailTemplateDialog(ctk.CTkToplevel):
+    """Edit email subject and body template."""
+
+    DEFAULT_SUBJECT = "Your file is ready: {filename}"
+    DEFAULT_BODY = (
+        "Hi,\n\n"
+        "Your file is ready to download:\n"
+        "{link}\n\n"
+        "Best,\n"
+        "{sender_name}"
+    )
+
+    def __init__(self, parent, cfg: dict):
+        super().__init__(parent)
+        self.title("Email Template")
+        self.geometry("480x420")
+        self.configure(fg_color=BG)
+        self.resizable(False, True)
+        self.grab_set()
+        self.lift()
+        self.after(50, self.lift)
+        self._cfg = cfg
+
+        ctk.CTkLabel(self, text="Email Template",
+                     font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 4))
+        ctk.CTkLabel(self,
+                     text="Variables:  {filename}  {link}  {date}  {sender_name}",
+                     font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 12))
+
+        form = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
+                            border_color=BORDER, border_width=1)
+        form.pack(fill="both", expand=True, padx=20)
+        form.columnconfigure(1, weight=1)
+        form.rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Subject", font=FONT_LABEL, text_color=TEXT2,
+                     anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(12, 6), sticky="nw")
+        self._subject_var = ctk.StringVar(
+            value=cfg.get("email_subject", self.DEFAULT_SUBJECT))
+        ctk.CTkEntry(form, textvariable=self._subject_var,
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=32, corner_radius=6).grid(
+                         row=0, column=1, padx=(0, 14), pady=(12, 6), sticky="ew")
+
+        ctk.CTkLabel(form, text="Body", font=FONT_LABEL, text_color=TEXT2,
+                     anchor="w").grid(row=1, column=0, padx=(14, 8), pady=(6, 12), sticky="nw")
+        self._body_box = ctk.CTkTextbox(
+            form, fg_color=BG3, border_color=BORDER, border_width=1,
+            text_color=TEXT, font=("SF Pro Text", 12), corner_radius=6, wrap="word")
+        self._body_box.grid(row=1, column=1, padx=(0, 14), pady=(6, 12), sticky="nsew")
+        self._body_box.insert("0.0", cfg.get("email_body", self.DEFAULT_BODY))
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(padx=20, pady=(8, 16), fill="x")
+        ctk.CTkButton(btn_row, text="Reset to Default", width=130, height=34,
+                      corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+                      command=self._reset).pack(side="left")
+        ctk.CTkButton(btn_row, text="Cancel", width=80, height=34, corner_radius=8,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self.destroy).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Save", width=80, height=34, corner_radius=8,
+                      fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+                      command=self._save).pack(side="right")
+
+    def _save(self):
+        self._cfg["email_subject"] = self._subject_var.get().strip()
+        self._cfg["email_body"] = self._body_box.get("0.0", "end").rstrip("\n")
+        config.save(self._cfg)
+        self.destroy()
+
+    def _reset(self):
+        self._subject_var.set(self.DEFAULT_SUBJECT)
+        self._body_box.delete("0.0", "end")
+        self._body_box.insert("0.0", self.DEFAULT_BODY)
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 class App(ctk.CTk):
@@ -963,8 +1193,11 @@ class App(ctk.CTk):
         self._folders = []
         self._progress_queue: queue.Queue = queue.Queue()
         self._active_workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
+        self._observer: Observer | None = None
+        self._export_handler: ExportHandler | None = None
 
         self._build_ui()
+        self._restore_panel_states()
         self._update_account_label()
         self._handle_startup_state()
         self._poll_progress()
@@ -1028,6 +1261,105 @@ class App(ctk.CTk):
 
         divider(self).pack(fill="x", padx=24, pady=12)
 
+        # ── Export Watch panel ────────────────────────────────────────────────
+        self._watch_card = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
+                                        border_color=BORDER, border_width=1)
+        self._watch_card.pack(fill="x", padx=24, pady=(0, 8))
+
+        watch_hdr = ctk.CTkFrame(self._watch_card, fg_color="transparent")
+        watch_hdr.pack(fill="x", padx=16, pady=10)
+        section_label(watch_hdr, "Export Watch").pack(side="left", pady=2)
+        self._watch_switch = ctk.CTkSwitch(
+            watch_hdr, text="", width=46, height=24,
+            button_color=ACCENT, button_hover_color="#0060df",
+            fg_color=BG3, progress_color=GREEN,
+            command=self._on_watch_toggle,
+        )
+        self._watch_switch.pack(side="right")
+
+        # Body — packed only when switch is ON
+        self._watch_body = ctk.CTkFrame(self._watch_card, fg_color="transparent")
+
+        wf_row = ctk.CTkFrame(self._watch_body, fg_color="transparent")
+        wf_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(wf_row, text="Folder", font=FONT_LABEL, text_color=TEXT2,
+                     width=56, anchor="w").pack(side="left")
+        self._watch_folder_var = ctk.StringVar(value=self._cfg.get("watch_folder", ""))
+        self._watch_folder_entry = ctk.CTkEntry(
+            wf_row, textvariable=self._watch_folder_var,
+            placeholder_text="/path/to/exports",
+            fg_color=BG3, border_color=BORDER, text_color=TEXT,
+            height=30, corner_radius=6)
+        self._watch_folder_entry.pack(side="left", fill="x", expand=True, padx=8)
+        ctk.CTkButton(wf_row, text="Browse", width=70, height=30, corner_radius=6,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self._browse_watch_folder).pack(side="left")
+
+        self._watch_status_label = ctk.CTkLabel(
+            self._watch_body, text="", font=FONT_SMALL, text_color=TEXT2, anchor="w")
+        self._watch_status_label.pack(fill="x", pady=(2, 10))
+
+        # ── Email Notification panel ──────────────────────────────────────────
+        self._email_card = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
+                                        border_color=BORDER, border_width=1)
+        self._email_card.pack(fill="x", padx=24, pady=(0, 8))
+
+        email_hdr = ctk.CTkFrame(self._email_card, fg_color="transparent")
+        email_hdr.pack(fill="x", padx=16, pady=10)
+        section_label(email_hdr, "Email Notification").pack(side="left", pady=2)
+        self._email_switch = ctk.CTkSwitch(
+            email_hdr, text="", width=46, height=24,
+            button_color=ACCENT, button_hover_color="#0060df",
+            fg_color=BG3, progress_color=GREEN,
+            command=self._on_email_toggle,
+        )
+        self._email_switch.pack(side="right")
+
+        # Body — packed only when switch is ON
+        self._email_body = ctk.CTkFrame(self._email_card, fg_color="transparent")
+
+        to_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
+        to_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(to_row, text="To", font=FONT_LABEL, text_color=TEXT2,
+                     width=56, anchor="w").pack(side="left")
+        self._recipient_var = ctk.StringVar(value=self._cfg.get("recipient_email", ""))
+        ctk.CTkEntry(to_row, textvariable=self._recipient_var,
+                     placeholder_text="client@example.com",
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=30, corner_radius=6).pack(side="left", fill="x", expand=True)
+        self._recipient_var.trace_add("write", self._on_recipient_change)
+
+        from_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
+        from_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(from_row, text="From", font=FONT_LABEL, text_color=TEXT2,
+                     width=56, anchor="w").pack(side="left")
+        self._sender_label = ctk.CTkLabel(
+            from_row, text="— not set up —", font=FONT_LABEL, text_color=TEXT2, anchor="w")
+        self._sender_label.pack(side="left", fill="x", expand=True, padx=8)
+        ctk.CTkButton(from_row, text="Setup", width=70, height=30, corner_radius=6,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self._setup_sender).pack(side="left")
+
+        bottom_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
+        bottom_row.pack(fill="x", pady=(0, 10))
+        self._auto_send_var = ctk.BooleanVar(value=bool(self._cfg.get("auto_send_email", True)))
+        ctk.CTkCheckBox(
+            bottom_row,
+            text="Auto-send after upload",
+            variable=self._auto_send_var,
+            font=FONT_LABEL, text_color=TEXT2,
+            fg_color=ACCENT, hover_color="#0060df",
+            command=self._on_auto_send_change,
+        ).pack(side="left")
+        ctk.CTkButton(
+            bottom_row, text="Template…", width=90, height=28, corner_radius=6,
+            fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+            font=FONT_SMALL,
+            command=self._edit_template,
+        ).pack(side="right")
+
+        divider(self).pack(fill="x", padx=24, pady=(4, 12))
+
         # Action buttons
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", padx=24)
@@ -1064,9 +1396,19 @@ class App(ctk.CTk):
         if not pending:
             return
 
-        # Rebuild queue rows for all pending entries
-        group_ids_seen = set()
-        for entry in pending:
+        # Show the dialog FIRST — creating widgets for every entry before asking
+        # freezes startup when there are many pending entries (e.g. from crash loops).
+        # Rows are only created if the user actually chooses to resume.
+        self._show_resume_dialog(pending)
+
+    def _add_rows_batch(self, pending: list, idx: int = 0):
+        """Add pending entries to the queue UI in small batches via after(),
+        so the event loop stays responsive while building many rows."""
+        _BATCH = 8
+        group_ids_seen = getattr(self, "_startup_group_ids_seen", set())
+        self._startup_group_ids_seen = group_ids_seen
+
+        for entry in pending[idx:idx + _BATCH]:
             if entry.group_id and entry.group_id not in group_ids_seen:
                 group_ids_seen.add(entry.group_id)
                 group_entries = [e for e in pending if e.group_id == entry.group_id]
@@ -1075,16 +1417,20 @@ class App(ctk.CTk):
                     len(group_entries))
             self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
 
-        # Ask user whether to resume
-        self._show_resume_dialog(len(pending))
+        next_idx = idx + _BATCH
+        if next_idx < len(pending):
+            self.after(10, lambda: self._add_rows_batch(pending, next_idx))
 
-    def _show_resume_dialog(self, n: int):
+    def _show_resume_dialog(self, pending: list):
+        n = len(pending)
         dlg = ctk.CTkToplevel(self)
         dlg.title("Resume Uploads")
         dlg.geometry("360x180")
         dlg.configure(fg_color=BG)
         dlg.resizable(False, False)
         dlg.grab_set()
+        dlg.lift()
+        dlg.after(50, dlg.lift)   # macOS sometimes pushes Toplevel behind main window
 
         s = "s" if n != 1 else ""
         ctk.CTkLabel(dlg, text=f"Resume {n} incomplete upload{s}?",
@@ -1099,16 +1445,12 @@ class App(ctk.CTk):
 
         def do_resume():
             dlg.destroy()
-            # Workers start after Drive connects
+            # Build queue rows lazily so the main thread stays responsive
+            self._add_rows_batch(pending, idx=0)
+            # Workers start automatically once _init_drive finishes
 
         def do_clear():
             self._state.clear_all_pending()
-            # Remove all rows from queue
-            for entry_id in list(self._queue_frame._rows.keys()):
-                row = self._queue_frame._rows.pop(entry_id)
-                row.pack_forget()
-                row.destroy()
-            self._queue_frame._group_headers.clear()
             dlg.destroy()
 
         ctk.CTkButton(btn_row, text="Resume", height=36, corner_radius=8,
@@ -1126,6 +1468,8 @@ class App(ctk.CTk):
         dlg.configure(fg_color=BG)
         dlg.resizable(False, False)
         dlg.grab_set()
+        dlg.lift()
+        dlg.after(50, dlg.lift)
         ctk.CTkLabel(dlg, text=msg, font=FONT_LABEL, text_color=TEXT2,
                      wraplength=340, justify="left").pack(padx=20, pady=(20, 12))
         ctk.CTkButton(dlg, text="OK", width=80, height=32, corner_radius=8,
@@ -1197,14 +1541,15 @@ class App(ctk.CTk):
 
     # ── Add files / folders ───────────────────────────────────────────────
 
-    def _add_files(self):
+    def _add_files(self, paths=None):
         if not self._cfg.get("drive_folder_id"):
             self._show_notice("Please select a Drive folder first.")
             return
-        paths = filedialog.askopenfilenames(
-            title="Select files to upload",
-            initialdir="/Volumes",
-        )
+        if paths is None:
+            paths = filedialog.askopenfilenames(
+                title="Select files to upload",
+                initialdir="/Volumes",
+            )
         if not paths:
             return
         folder_id = self._cfg["drive_folder_id"]
@@ -1365,7 +1710,10 @@ class App(ctk.CTk):
         if entry_id in self._active_workers:
             _, stop_event = self._active_workers[entry_id]
             stop_event.set()
-            # Worker catches StopRequested, saves session, posts "cancelled"
+            # Immediate visual feedback — don't wait for worker to confirm via queue
+            row = self._queue_frame.get_row(entry_id)
+            if row:
+                row.set_pausing()
         else:
             # Queued but not started — mark as failed (nothing to resume)
             self._state.update(entry_id, status="failed", error="Cancelled by user")
@@ -1439,7 +1787,7 @@ class App(ctk.CTk):
 
         except queue.Empty:
             pass
-        self.after(200, self._poll_progress)
+        self.after(100, self._poll_progress)
 
     def _on_upload_done(self, entry_id: str, drive_file_id: str):
         self._active_workers.pop(entry_id, None)
@@ -1464,6 +1812,14 @@ class App(ctk.CTk):
                 _, _, n_done, n_total = self._state.get_group_progress(entry.group_id)
                 hdr.update_count(n_done)
 
+        # Email notification (background thread)
+        if self._cfg.get("email_enabled") and drive_file_id and entry:
+            threading.Thread(
+                target=self._post_upload_email,
+                args=(entry, drive_file_id),
+                daemon=True,
+            ).start()
+
         self._start_next_uploads()
 
     def _on_upload_error(self, entry_id: str, error_msg: str):
@@ -1479,9 +1835,178 @@ class App(ctk.CTk):
         self._state.clear_completed()
         self._queue_frame.remove_completed_rows()
 
+    # ── Optional panel restore ────────────────────────────────────────────────
+
+    def _restore_panel_states(self):
+        """Re-expand optional panels and update labels based on saved config."""
+        if self._cfg.get("watch_enabled"):
+            self._watch_switch.select()
+            self._watch_body.pack(fill="x", padx=16, pady=(0, 0))
+            self._start_watching()
+        if self._cfg.get("email_enabled"):
+            self._email_switch.select()
+            self._email_body.pack(fill="x", padx=16, pady=(0, 0))
+        self._update_sender_label()
+
+    # ── Export Watch ──────────────────────────────────────────────────────────
+
+    def _on_watch_toggle(self):
+        enabled = bool(self._watch_switch.get())
+        self._cfg["watch_folder"] = self._watch_folder_var.get()
+        self._cfg["watch_enabled"] = enabled
+        config.save(self._cfg)
+        if enabled:
+            self._watch_body.pack(fill="x", padx=16, pady=(0, 0))
+            self._start_watching()
+        else:
+            self._watch_body.pack_forget()
+            self._stop_watching()
+
+    def _browse_watch_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select folder to watch for exports",
+            initialdir=self._watch_folder_var.get() or str(Path.home()),
+        )
+        if folder:
+            self._watch_folder_var.set(folder)
+            self._cfg["watch_folder"] = folder
+            config.save(self._cfg)
+            if bool(self._watch_switch.get()):
+                self._stop_watching()
+                self._start_watching()
+
+    def _start_watching(self):
+        folder = self._cfg.get("watch_folder", "").strip()
+        if not folder or not Path(folder).is_dir():
+            self._watch_status_label.configure(
+                text="⚠  Set a valid watch folder above", text_color=YELLOW)
+            return
+        self._export_handler = ExportHandler(self._on_export_ready)
+        self._observer = Observer()
+        self._observer.schedule(self._export_handler, folder, recursive=False)
+        self._observer.start()
+        name = Path(folder).name
+        self._watch_status_label.configure(
+            text=f"●  Watching  •  {name}", text_color=GREEN)
+
+    def _stop_watching(self):
+        if self._observer:
+            self._observer.stop()
+            self._observer.join(timeout=2)
+            self._observer = None
+        self._export_handler = None
+        if hasattr(self, "_watch_status_label"):
+            self._watch_status_label.configure(text="Stopped", text_color=TEXT2)
+
+    def _on_export_ready(self, path: str):
+        """Called from watchdog thread when export file size is stable."""
+        self.after(0, lambda: self._add_files([path]))
+
+    # ── Email Notification ────────────────────────────────────────────────────
+
+    def _on_email_toggle(self):
+        enabled = bool(self._email_switch.get())
+        self._cfg["email_enabled"] = enabled
+        config.save(self._cfg)
+        if enabled:
+            self._email_body.pack(fill="x", padx=16, pady=(0, 0))
+        else:
+            self._email_body.pack_forget()
+
+    def _on_recipient_change(self, *_):
+        self._cfg["recipient_email"] = self._recipient_var.get()
+        config.save(self._cfg)
+
+    def _on_auto_send_change(self):
+        self._cfg["auto_send_email"] = bool(self._auto_send_var.get())
+        config.save(self._cfg)
+
+    def _setup_sender(self):
+        dlg = EmailSetupDialog(self)
+        self.wait_window(dlg)
+        self._update_sender_label()
+
+    def _edit_template(self):
+        dlg = EmailTemplateDialog(self, self._cfg)
+        self.wait_window(dlg)
+
+    def _update_sender_label(self):
+        prof = sender_profile.load()
+        if prof and prof.get("sender_name"):
+            self._sender_label.configure(
+                text=f"{prof['sender_name']} <{prof['sender_email']}>",
+                text_color=TEXT)
+        else:
+            self._sender_label.configure(text="— not set up —", text_color=TEXT2)
+
+    def _post_upload_email(self, entry: UploadEntry, drive_file_id: str):
+        """Background thread: make file shareable, send email if configured."""
+        try:
+            account_id = self._cfg.get("active_drive_account_id", "")
+            if account_id and drive_accounts.token_path(account_id).exists():
+                svc = drive_accounts.build_thread_service(account_id)
+            else:
+                svc = drivelib.build_thread_service()
+
+            # Make file accessible to anyone with the link
+            svc.permissions().create(
+                fileId=drive_file_id,
+                body={"role": "reader", "type": "anyone"},
+                fields="id",
+            ).execute()
+            result = svc.files().get(
+                fileId=drive_file_id,
+                fields="webViewLink",
+            ).execute()
+            link = result.get("webViewLink", "")
+
+            if not self._cfg.get("auto_send_email"):
+                return  # share link created but auto-send is off
+
+            recipient = self._cfg.get("recipient_email", "").strip()
+            if not recipient:
+                return
+
+            prof = sender_profile.load()
+            if not prof or not prof.get("gmail_app_password"):
+                self.after(0, lambda: self._show_notice(
+                    "Email notification enabled but sender not configured.\n"
+                    "Click Setup in the Email Notification panel."))
+                return
+
+            from datetime import date as _date
+            subs = {
+                "filename": entry.file_name,
+                "link": link,
+                "date": _date.today().strftime("%B %d, %Y"),
+                "sender_name": prof.get("sender_name", ""),
+            }
+            subject = self._cfg.get(
+                "email_subject", "Your file is ready: {filename}").format_map(subs)
+            body = self._cfg.get(
+                "email_body",
+                "Hi,\n\nYour file is ready:\n{link}\n\nBest,\n{sender_name}",
+            ).format_map(subs)
+
+            mailer.send(
+                sender_email=prof["sender_email"],
+                app_password=prof["gmail_app_password"],
+                recipient=recipient,
+                subject=subject,
+                body=body,
+            )
+            self.after(0, lambda: self._show_notice(
+                f"✓ Email sent to {recipient}\nfor {entry.file_name}"))
+
+        except Exception as e:
+            err = str(e)
+            self.after(0, lambda: self._show_notice(f"Email notification failed:\n{err}"))
+
     # ── Window close ──────────────────────────────────────────────────────
 
     def _on_close(self):
+        # Stop watchdog observer cleanly before exit
+        self._stop_watching()
         # Signal all active workers to stop (they save state before exiting)
         for entry_id, (thread, stop_event) in list(self._active_workers.items()):
             stop_event.set()

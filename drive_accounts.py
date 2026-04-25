@@ -15,10 +15,34 @@ import os
 import uuid
 from pathlib import Path
 
-from google.auth.transport.requests import Request
+import requests as _requests
+from google.auth.transport.requests import Request, AuthorizedSession as _AuthorizedSession
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+# Re-use the same requests-based HTTP adapter defined in drive.py
+# to avoid importing it from there (circular imports). Copy is minimal.
+class _FakeResponse(dict):
+    fromcache = False; version = 11; previous = None
+    def __init__(self, r):
+        super().__init__({k.lower(): v for k, v in r.headers.items()})
+        self.status = r.status_code; self.reason = r.reason
+
+class _RequestsHttp:
+    def __init__(self, creds):
+        self._session = _AuthorizedSession(creds)
+    def request(self, uri, method="GET", body=None, headers=None,
+                redirections=10, connection_type=None):
+        resp = self._session.request(method=method, url=uri, data=body,
+                                     headers=headers or {},
+                                     allow_redirects=(redirections > 0))
+        return _FakeResponse(resp), resp.content
+    def close(self):
+        self._session.close()
+
+def _build_service(creds):
+    return build("drive", "v3", http=_RequestsHttp(creds))
 
 ACCOUNTS_DIR = Path.home() / ".drive-accounts"
 INDEX_PATH = ACCOUNTS_DIR / "index.json"
@@ -79,7 +103,7 @@ def add_account(source_credentials_path, display_name: str = "") -> dict:
     creds = flow.run_local_server(port=0)
 
     # Fetch the signed-in email from the Drive API
-    svc = build("drive", "v3", credentials=creds)
+    svc = _build_service(creds)
     email = (
         svc.about().get(fields="user").execute()
         .get("user", {}).get("emailAddress", "")
@@ -129,18 +153,14 @@ def get_service(account_id: str):
     if not creds.valid and creds.expired and creds.refresh_token:
         creds.refresh(Request())
         tp.write_text(creds.to_json())
-    return build("drive", "v3", credentials=creds)
+    return _build_service(creds)
 
 
 def build_thread_service(account_id: str):
-    """Return a NEW thread-safe Drive service for a saved account.
-
-    Each upload worker thread must call this to get an independent service —
-    httplib2 is not thread-safe.
-    """
+    """Return a NEW Drive service for a saved account (requests transport)."""
     tp = token_path(account_id)
     creds = Credentials.from_authorized_user_file(str(tp), SCOPES)
     if not creds.valid and creds.expired and creds.refresh_token:
         creds.refresh(Request())
         tp.write_text(creds.to_json())
-    return build("drive", "v3", credentials=creds)
+    return _build_service(creds)

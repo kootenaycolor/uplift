@@ -18,11 +18,69 @@ import os
 import socket
 from pathlib import Path
 
-from google.auth.transport.requests import Request
+import requests as _requests
+from google.auth.transport.requests import Request, AuthorizedSession as _AuthorizedSession
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+
+
+# ── requests-based HTTP adapter (replaces httplib2 + OpenSSL) ─────────────────
+#
+# googleapiclient uses httplib2 by default. httplib2 manages SSL record
+# buffers directly via OpenSSL's CRYPTO_malloc / ssl3_setup_read_buffer,
+# which macOS 26's xzone allocator flags as heap corruption.
+# Token refresh already uses requests + Python ssl and never crashes.
+# This adapter makes ALL Drive API calls use the same requests/urllib3/ssl
+# stack, eliminating the crash vector entirely.
+
+class _FakeResponse(dict):
+    """httplib2-compatible response wrapper around requests.Response.
+
+    httplib2 returns (response, content) where response is a dict of
+    lowercase headers with .status and .reason attributes.
+    """
+    fromcache = False
+    version = 11
+    previous = None
+
+    def __init__(self, r):
+        super().__init__({k.lower(): v for k, v in r.headers.items()})
+        self.status = r.status_code
+        self.reason = r.reason
+
+
+class _RequestsHttp:
+    """Minimal httplib2-compatible HTTP adapter backed by requests.
+
+    Pass an instance as http= to googleapiclient.discovery.build() to
+    route all API traffic through requests/urllib3 instead of httplib2.
+    Each service object should get its own _RequestsHttp so that
+    AuthorizedSession objects are never shared across threads.
+    """
+
+    def __init__(self, creds):
+        self._session = _AuthorizedSession(creds)
+
+    def request(self, uri, method="GET", body=None, headers=None,
+                redirections=10, connection_type=None):
+        resp = self._session.request(
+            method=method,
+            url=uri,
+            data=body,
+            headers=headers or {},
+            allow_redirects=(redirections > 0),
+        )
+        return _FakeResponse(resp), resp.content
+
+    def close(self):
+        self._session.close()
+
+
+def _build_service(creds):
+    """Build an authenticated Drive v3 service using requests transport."""
+    return build("drive", "v3", http=_RequestsHttp(creds))
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB — must be a multiple of 256 KB
@@ -61,18 +119,15 @@ def get_service(token_path_override=None, credentials_path_override=None):
 
         _tp.write_text(creds.to_json())
 
-    return build("drive", "v3", credentials=creds)
+    return _build_service(creds)
 
 
 def build_thread_service(token_path_override=None):
-    """Return a NEW Drive service with its own HTTP connection.
+    """Return a NEW Drive service with its own requests-based HTTP connection.
 
     Each upload worker thread MUST call this to get an independent service.
-    httplib2's HTTP object is not thread-safe — sharing a single service across
-    concurrent upload threads corrupts OpenSSL's internal buffers, which
-    macOS 26's xzone malloc allocator detects as memory corruption.
-
-    Pass token_path_override to use a non-default account.
+    _RequestsHttp wraps AuthorizedSession which is NOT thread-safe to share —
+    each call here returns a fresh session with no shared SSL state.
     """
     _tp = Path(token_path_override) if token_path_override else TOKEN_PATH
     creds = Credentials.from_authorized_user_file(str(_tp), SCOPES)
@@ -80,7 +135,7 @@ def build_thread_service(token_path_override=None):
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
             _tp.write_text(creds.to_json())
-    return build("drive", "v3", credentials=creds)
+    return _build_service(creds)
 
 
 # ── Folder listing ────────────────────────────────────────────────────────────
@@ -98,6 +153,16 @@ def list_folders(service):
     folders = []
 
     # ── My Drive folders ──────────────────────────────────────────────────────
+    # Fetch the actual My Drive root folder ID so we can distinguish:
+    #   - true root-level folders  (parent == my_drive_root_id)
+    #   - Computers/My Mac orphans (parent is some other non-folder container)
+    # Without this, Computers-synced folders appear at My Drive root level.
+    try:
+        my_drive_root_id = service.files().get(
+            fileId="root", fields="id").execute()["id"]
+    except Exception:
+        my_drive_root_id = None
+
     my_drive_raw = []
     page_token = None
     while True:
@@ -113,8 +178,76 @@ def list_folders(service):
         if not page_token:
             break
 
-    # Normalize parent_id: if parent is not another My Drive folder → it's root
+    # Prune non-My-Drive items in two passes:
+    #   Pass 1 – BFS from folders with parents=[] (Computers-sync roots like "My Mac")
+    #            removes them and ALL their descendants.
+    #   Pass 2 – After pass 1, any remaining folder whose raw parent is neither
+    #            another My Drive folder NOR the My Drive root is also an orphan
+    #            from a non-folder container (e.g. a "Computers" parent that itself
+    #            had a parent, so it wasn't caught by pass 1). Exclude those too.
+    from collections import deque as _deque
+    _child_map = {}
+    for f in my_drive_raw:
+        raw_p = (f.get("parents") or [None])[0]
+        if raw_p:
+            _child_map.setdefault(raw_p, []).append(f["id"])
+
+    _external = {f["id"] for f in my_drive_raw if not f.get("parents")}
+    _q = _deque(_external)
+    while _q:
+        pid = _q.popleft()
+        for cid in _child_map.get(pid, []):
+            if cid not in _external:
+                _external.add(cid)
+                _q.append(cid)
+    my_drive_raw = [f for f in my_drive_raw if f["id"] not in _external]
+
+    # Pass 2: keep only folders whose full ancestor chain reaches the My Drive
+    # root.  A single-level parent check isn't enough — some Computers-synced
+    # folders have a parent that IS another folder in our list, but that parent
+    # itself is an orphan.  Walk up the chain with memoization (O(n) total).
+    if my_drive_root_id:
+        _raw_parent = {
+            f["id"]: (f.get("parents") or [None])[0]
+            for f in my_drive_raw
+        }
+        _reachable: dict[str, bool] = {}
+
+        def _reaches_root(fid: str) -> bool:
+            if fid in _reachable:
+                return _reachable[fid]
+            visited: set[str] = set()
+            cur = fid
+            # Collect the path so we can memoize the whole chain at once
+            path: list[str] = []
+            while True:
+                if cur in _reachable:
+                    result = _reachable[cur]
+                    break
+                if cur in visited:        # cycle → orphan
+                    result = False
+                    break
+                visited.add(cur)
+                path.append(cur)
+                par = _raw_parent.get(cur)
+                if par is None:           # no parent → orphan
+                    result = False
+                    break
+                if par == my_drive_root_id:
+                    result = True         # reached My Drive root
+                    break
+                if par not in _raw_parent:
+                    result = False        # parent outside list → orphan
+                    break
+                cur = par
+            for p in path:
+                _reachable[p] = result
+            return result
+
+        my_drive_raw = [f for f in my_drive_raw if _reaches_root(f["id"])]
+
     my_drive_ids = {f["id"] for f in my_drive_raw}
+
     for f in my_drive_raw:
         raw_parent = (f.get("parents") or [None])[0]
         parent_id = raw_parent if raw_parent in my_drive_ids else "my_drive"

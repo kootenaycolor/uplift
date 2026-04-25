@@ -13,6 +13,21 @@ DEFAULTS = {
     "drive_folder_id": "",
     "drive_folder_name": "",
     "active_drive_account_id": "",
+    # Export Watch
+    "watch_enabled": False,
+    "watch_folder": "",
+    # Email Notification
+    "email_enabled": False,
+    "recipient_email": "",
+    "email_subject": "Your file is ready: {filename}",
+    "email_body": (
+        "Hi,\n\n"
+        "Your file is ready to download:\n"
+        "{link}\n\n"
+        "Best,\n"
+        "{sender_name}"
+    ),
+    "auto_send_email": True,
 }
 
 

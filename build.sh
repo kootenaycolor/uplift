@@ -94,7 +94,7 @@ clang -O2 -o "$DIST/Contents/MacOS/Drive Uploader" "$LAUNCHER_SRC"
 rm -f "$LAUNCHER_SRC"
 
 # ── Source files ────────────────────────────────────────────────────────────
-for f in main.py drive.py state.py config.py drive_accounts.py requirements.txt; do
+for f in main.py drive.py state.py config.py drive_accounts.py mailer.py sender_profile.py requirements.txt; do
   cp "$SCRIPT_DIR/$f" "$DIST/Contents/Resources/"
 done
 
