@@ -684,6 +684,15 @@ class UploadRowFrame(ctk.CTkFrame):
         )
         self._cancel_btn.pack(side="left")
 
+        # Resume button — only visible when paused
+        self._resume_btn = ctk.CTkButton(
+            mid, text="▶", width=28, height=26, corner_radius=6,
+            fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+            font=("SF Pro Text", 13),
+            command=lambda: self._resume_callback(self._entry_id) if self._resume_callback else None,
+        )
+        # Not packed yet — shown only in set_paused()
+
         # ── Bottom row: stats ──
         self._stats = ctk.CTkLabel(self, text="—",
                                     font=FONT_SMALL, text_color=TEXT2, anchor="w")
@@ -709,28 +718,30 @@ class UploadRowFrame(ctk.CTkFrame):
     # ── Progress updates ──
 
     def update_progress(self, bytes_read: int):
-        """Smooth update from ProgressFileWrapper reads (intra-chunk)."""
+        """Smooth update from ProgressFileWrapper reads (intra-chunk).
+        Rate is computed here from a rolling 8-second window so it shows
+        continuously — not just at 25 MB chunk boundaries."""
         if self._file_size <= 0:
             return
+        now = time.monotonic()
         self._bytes_display = min(bytes_read, self._file_size)
         self._bar.set(self._bytes_display / self._file_size)
-        self._refresh_stats()
-
-    def confirm_progress(self, bytes_confirmed: int):
-        """Chunk confirmed by Drive. Updates rolling rate samples."""
-        self._bytes_confirmed = bytes_confirmed
-        now = time.monotonic()
-        self._rate_samples.append((now, bytes_confirmed))
-        # Keep last 20 seconds of samples
-        cutoff = now - 20.0
+        # Rolling rate from sub-chunk reads (fires every few hundred KB)
+        self._rate_samples.append((now, self._bytes_display))
+        cutoff = now - 8.0
         while self._rate_samples and self._rate_samples[0][0] < cutoff:
             self._rate_samples.popleft()
         if len(self._rate_samples) >= 2:
             t0, b0 = self._rate_samples[0]
             t1, b1 = self._rate_samples[-1]
             dt = t1 - t0
-            if dt > 0.1:
+            if dt > 0.2:
                 self._rate = (b1 - b0) / dt
+        self._refresh_stats()
+
+    def confirm_progress(self, bytes_confirmed: int):
+        """Chunk confirmed by Drive — update confirmed byte count for ETA accuracy."""
+        self._bytes_confirmed = bytes_confirmed
         self._set_badge("Uploading", ACCENT, TEXT)
         self._refresh_stats()
 
@@ -766,6 +777,7 @@ class UploadRowFrame(ctk.CTkFrame):
         self._bar.set(1.0)
         self._bar.configure(progress_color=GREEN)
         self._set_badge("Done", GREEN, "#1c1c1e")
+        self._resume_btn.pack_forget()
         self._cancel_btn.configure(text="✓", state="disabled",
                                     fg_color=BG3, hover_color=BG3, text_color=GREEN)
         self._stats.configure(text=f"{_fmt_size(self._file_size)} uploaded successfully",
@@ -777,7 +789,7 @@ class UploadRowFrame(ctk.CTkFrame):
         self._cancel_btn.configure(state="disabled", text="…")
 
     def set_paused(self):
-        """Upload was stopped by user. Show resume button."""
+        """Upload was stopped by user. Show cancel + resume buttons."""
         self._rate_samples.clear()
         self._rate = 0.0
         self._set_badge("Paused", BG3, TEXT2)
@@ -785,12 +797,14 @@ class UploadRowFrame(ctk.CTkFrame):
         total = _fmt_size(self._file_size)
         pct = int(self._bytes_confirmed / self._file_size * 100) if self._file_size else 0
         self._stats.configure(text=f"Paused at {done} / {total} ({pct}%)", text_color=TEXT2)
-        # Switch cancel button to a resume button
+        # ✕ cancels (kills the upload permanently)
         self._cancel_btn.configure(
-            text="▶", fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+            text="✕", fg_color=BG3, hover_color=RED, text_color=TEXT2,
             state="normal",
-            command=lambda: self._resume_callback(self._entry_id) if self._resume_callback else None,
+            command=lambda: self._cancel_callback(self._entry_id),
         )
+        # ▶ resumes — show it next to cancel
+        self._resume_btn.pack(side="left", padx=(4, 0))
 
     def set_queued(self):
         """Reset to queued state (e.g. after pausing and re-queueing)."""
@@ -798,6 +812,7 @@ class UploadRowFrame(ctk.CTkFrame):
         self._rate = 0.0
         self._set_badge("Queued", BG3, TEXT2)
         self._stats.configure(text="Waiting to upload…", text_color=TEXT2)
+        self._resume_btn.pack_forget()
         self._cancel_btn.configure(
             text="✕", fg_color=BG3, hover_color=RED, text_color=TEXT2,
             state="normal",
@@ -809,7 +824,8 @@ class UploadRowFrame(ctk.CTkFrame):
         self._rate_samples.clear()
         self._rate = 0.0
         self._set_badge("Uploading", ACCENT, TEXT)
-        # Restore pause button (may have been a resume ▶ button)
+        self._resume_btn.pack_forget()
+        # Show ⏸ pause button
         self._cancel_btn.configure(
             text="⏸", fg_color=BG3, hover_color=YELLOW, text_color=TEXT2,
             state="normal",
@@ -818,6 +834,7 @@ class UploadRowFrame(ctk.CTkFrame):
 
     def set_failed(self, msg: str):
         self._set_badge("Failed", RED, TEXT)
+        self._resume_btn.pack_forget()
         self._cancel_btn.configure(state="disabled")
         short = msg if len(msg) < 65 else msg[:63] + "…"
         self._stats.configure(text=f"Error: {short}", text_color=RED)
