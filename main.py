@@ -1190,7 +1190,7 @@ class EmailSetupDialog(ctk.CTkToplevel):
 # ── Email Template Dialog ─────────────────────────────────────────────────────
 
 class EmailTemplateDialog(ctk.CTkToplevel):
-    """Edit email subject and body template."""
+    """Edit email subject and body template, optionally scoped to a Drive account."""
 
     DEFAULT_SUBJECT = "Your file is ready: {filename}"
     DEFAULT_BODY = (
@@ -1201,22 +1201,31 @@ class EmailTemplateDialog(ctk.CTkToplevel):
         "{sender_name}"
     )
 
-    def __init__(self, parent, cfg: dict):
+    def __init__(self, parent, cfg: dict, account_id: str = "", account_name: str = ""):
         super().__init__(parent)
         self.title("Email Template")
-        self.geometry("480x420")
+        self.geometry("480x440")
         self.configure(fg_color=BG)
         self.resizable(False, True)
         self.grab_set()
         self.lift()
         self.after(50, self.lift)
         self._cfg = cfg
+        self._account_id = account_id
 
-        ctk.CTkLabel(self, text="Email Template",
+        # Per-account template dict (or empty if no account)
+        acct_tmpl = cfg.get("account_templates", {}).get(account_id, {}) if account_id else {}
+
+        title_text = f"Email Template — {account_name}" if account_name else "Email Template"
+        ctk.CTkLabel(self, text=title_text,
                      font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 4))
         ctk.CTkLabel(self,
                      text="Variables:  {filename}  {link}  {date}  {sender_name}",
                      font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 12))
+        if account_id:
+            ctk.CTkLabel(self,
+                         text="This template overrides the default for this account only.",
+                         font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 8))
 
         form = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
                             border_color=BORDER, border_width=1)
@@ -1227,7 +1236,8 @@ class EmailTemplateDialog(ctk.CTkToplevel):
         ctk.CTkLabel(form, text="Subject", font=FONT_LABEL, text_color=TEXT2,
                      anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(12, 6), sticky="nw")
         self._subject_var = ctk.StringVar(
-            value=cfg.get("email_subject", self.DEFAULT_SUBJECT))
+            value=acct_tmpl.get("email_subject",
+                  cfg.get("email_subject", self.DEFAULT_SUBJECT)))
         ctk.CTkEntry(form, textvariable=self._subject_var,
                      fg_color=BG3, border_color=BORDER, text_color=TEXT,
                      height=32, corner_radius=6).grid(
@@ -1239,7 +1249,8 @@ class EmailTemplateDialog(ctk.CTkToplevel):
             form, fg_color=BG3, border_color=BORDER, border_width=1,
             text_color=TEXT, font=("SF Pro Text", 12), corner_radius=6, wrap="word")
         self._body_box.grid(row=1, column=1, padx=(0, 14), pady=(6, 12), sticky="nsew")
-        self._body_box.insert("0.0", cfg.get("email_body", self.DEFAULT_BODY))
+        self._body_box.insert("0.0", acct_tmpl.get("email_body",
+                              cfg.get("email_body", self.DEFAULT_BODY)))
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(padx=20, pady=(8, 16), fill="x")
@@ -1254,8 +1265,15 @@ class EmailTemplateDialog(ctk.CTkToplevel):
                       command=self._save).pack(side="right")
 
     def _save(self):
-        self._cfg["email_subject"] = self._subject_var.get().strip()
-        self._cfg["email_body"] = self._body_box.get("0.0", "end").rstrip("\n")
+        subject = self._subject_var.get().strip()
+        body = self._body_box.get("0.0", "end").rstrip("\n")
+        if self._account_id:
+            # Save to per-account template slot
+            templates = self._cfg.setdefault("account_templates", {})
+            templates[self._account_id] = {"email_subject": subject, "email_body": body}
+        else:
+            self._cfg["email_subject"] = subject
+            self._cfg["email_body"] = body
         config.save(self._cfg)
         self.destroy()
 
@@ -1410,13 +1428,35 @@ class App(ctk.CTk):
         to_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
         to_row.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(to_row, text="To", font=FONT_LABEL, text_color=TEXT2,
-                     width=56, anchor="w").pack(side="left")
+                     width=44, anchor="w").pack(side="left")
         self._recipient_var = ctk.StringVar(value=self._cfg.get("recipient_email", ""))
         ctk.CTkEntry(to_row, textvariable=self._recipient_var,
-                     placeholder_text="client@example.com",
+                     placeholder_text="client@example.com, other@example.com",
                      fg_color=BG3, border_color=BORDER, text_color=TEXT,
                      height=30, corner_radius=6).pack(side="left", fill="x", expand=True)
         self._recipient_var.trace_add("write", self._on_recipient_change)
+
+        cc_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
+        cc_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(cc_row, text="CC", font=FONT_LABEL, text_color=TEXT2,
+                     width=44, anchor="w").pack(side="left")
+        self._cc_var = ctk.StringVar(value=self._cfg.get("recipient_cc", ""))
+        ctk.CTkEntry(cc_row, textvariable=self._cc_var,
+                     placeholder_text="optional, comma-separated",
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=30, corner_radius=6).pack(side="left", fill="x", expand=True)
+        self._cc_var.trace_add("write", self._on_cc_change)
+
+        bcc_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
+        bcc_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(bcc_row, text="BCC", font=FONT_LABEL, text_color=TEXT2,
+                     width=44, anchor="w").pack(side="left")
+        self._bcc_var = ctk.StringVar(value=self._cfg.get("recipient_bcc", ""))
+        ctk.CTkEntry(bcc_row, textvariable=self._bcc_var,
+                     placeholder_text="optional, comma-separated",
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=30, corner_radius=6).pack(side="left", fill="x", expand=True)
+        self._bcc_var.trace_add("write", self._on_bcc_change)
 
         from_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
         from_row.pack(fill="x", pady=(0, 4))
@@ -2030,6 +2070,14 @@ class App(ctk.CTk):
         self._cfg["recipient_email"] = self._recipient_var.get()
         config.save(self._cfg)
 
+    def _on_cc_change(self, *_):
+        self._cfg["recipient_cc"] = self._cc_var.get()
+        config.save(self._cfg)
+
+    def _on_bcc_change(self, *_):
+        self._cfg["recipient_bcc"] = self._bcc_var.get()
+        config.save(self._cfg)
+
     def _on_auto_send_change(self):
         self._cfg["auto_send_email"] = bool(self._auto_send_var.get())
         config.save(self._cfg)
@@ -2040,7 +2088,14 @@ class App(ctk.CTk):
         self._update_sender_label()
 
     def _edit_template(self):
-        dlg = EmailTemplateDialog(self, self._cfg)
+        account_id = self._cfg.get("active_drive_account_id", "")
+        account_name = ""
+        if account_id:
+            acct = drive_accounts.get_account(account_id)
+            if acct:
+                account_name = acct.get("name", "")
+        dlg = EmailTemplateDialog(self, self._cfg, account_id=account_id,
+                                  account_name=account_name)
         self.wait_window(dlg)
 
     def _update_sender_label(self):
@@ -2087,6 +2142,10 @@ class App(ctk.CTk):
                     "Click Setup in the Email Notification panel."))
                 return
 
+            # Per-account template overrides global template
+            account_id = self._cfg.get("active_drive_account_id", "")
+            acct_tmpl = self._cfg.get("account_templates", {}).get(account_id, {})
+
             from datetime import date as _date
             subs = {
                 "filename": entry.file_name,
@@ -2094,12 +2153,18 @@ class App(ctk.CTk):
                 "date": _date.today().strftime("%B %d, %Y"),
                 "sender_name": prof.get("sender_name", ""),
             }
-            subject = self._cfg.get(
-                "email_subject", "Your file is ready: {filename}").format_map(subs)
-            body = self._cfg.get(
-                "email_body",
-                "Hi,\n\nYour file is ready:\n{link}\n\nBest,\n{sender_name}",
+            subject = acct_tmpl.get(
+                "email_subject",
+                self._cfg.get("email_subject", "Your file is ready: {filename}")
             ).format_map(subs)
+            body = acct_tmpl.get(
+                "email_body",
+                self._cfg.get("email_body",
+                              "Hi,\n\nYour file is ready:\n{link}\n\nBest,\n{sender_name}")
+            ).format_map(subs)
+
+            cc  = self._cfg.get("recipient_cc", "")
+            bcc = self._cfg.get("recipient_bcc", "")
 
             mailer.send(
                 sender_email=prof["sender_email"],
@@ -2107,6 +2172,8 @@ class App(ctk.CTk):
                 recipient=recipient,
                 subject=subject,
                 body=body,
+                cc=cc,
+                bcc=bcc,
             )
             self.after(0, lambda: self._show_notice(
                 f"✓ Email sent to {recipient}\nfor {entry.file_name}"))

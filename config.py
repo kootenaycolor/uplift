@@ -18,7 +18,9 @@ DEFAULTS = {
     "watch_folder": "",
     # Email Notification
     "email_enabled": False,
-    "recipient_email": "",
+    "recipient_email": "",       # comma-separated To addresses
+    "recipient_cc": "",          # comma-separated CC addresses
+    "recipient_bcc": "",         # comma-separated BCC addresses
     "email_subject": "Your file is ready: {filename}",
     "email_body": (
         "Hi,\n\n"
@@ -28,6 +30,8 @@ DEFAULTS = {
         "{sender_name}"
     ),
     "auto_send_email": True,
+    # Per-account email templates: {account_id: {email_subject, email_body}}
+    "account_templates": {},
 }
 
 
