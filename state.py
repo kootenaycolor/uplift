@@ -23,7 +23,7 @@ def _now() -> str:
 @dataclass
 class UploadEntry:
     id: str
-    status: str          # queued | in_progress | compressing | completed | failed
+    status: str          # queued | in_progress | compressing | paused | completed | failed
     local_path: str
     file_name: str
     file_size: int
@@ -123,7 +123,7 @@ class StateManager:
         """Entries that are not yet done — shown in queue on startup."""
         with self._lock:
             return [e for e in self._entries
-                    if e.status in ("queued", "in_progress", "compressing")]
+                    if e.status in ("queued", "in_progress", "compressing", "paused")]
 
     def get_queued(self) -> List[UploadEntry]:
         """Entries ready to start uploading (not yet started)."""
@@ -140,7 +140,7 @@ class StateManager:
         """Used when user declines resume on startup."""
         with self._lock:
             for e in self._entries:
-                if e.status in ("queued", "in_progress", "compressing"):
+                if e.status in ("queued", "in_progress", "compressing", "paused"):
                     e.status = "failed"
                     e.error = "Cleared by user"
             self._save()

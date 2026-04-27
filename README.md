@@ -8,6 +8,7 @@ A macOS app for uploading any file or folder to Google Drive — built for large
 
 - **Upload any file or folder** from anywhere on your Mac — external drives, NAS, local storage
 - **Resumable uploads** — session URI saved after every chunk; picks up exactly where it left off after a crash or network drop
+- **Pause / Resume** — ⏸ pauses mid-upload and saves position; ▶ resumes instantly from the same byte
 - **Real-time progress** — per-file progress bars with data rate and ETA
 - **ZIP or Keep Structure** mode for folder uploads
 - **Multiple named Google Drive accounts** — switch between personal and client accounts
@@ -132,7 +133,8 @@ You need a `credentials.json` file from Google Cloud Console for each Google acc
 4. *(Optional)* Toggle **Email Notification** on → enter recipient → click **Setup** for sender config
 5. Click **+ Add Files…** or **Add Folder…** to queue uploads manually
 6. Uploads start automatically — progress bars show rate and ETA per file
-7. If interrupted, reopen and click **Resume** — uploads continue from where they left off
+7. Click **⏸** on any row to pause mid-upload; click **▶** to resume from the same byte
+8. If the app is closed mid-upload, reopen and click **Resume** — continues from where it left off
 
 ---
 

@@ -393,6 +393,26 @@ class UploadWorker:
         self._stop = stop_event
         self._account_id = account_id
 
+    def _countdown_retry(self, entry_id: str, retry_count: int) -> bool:
+        """Backoff sleep with per-second countdown status updates.
+
+        Returns True to continue retrying, False if stop_event was set
+        (caller should save state and exit cleanly).
+        """
+        wait = min(2 ** (retry_count - 1), 16)
+        for remaining in range(wait, 0, -1):
+            if self._stop.is_set():
+                return False
+            self._pq.put(("status", entry_id,
+                f"Network error — retrying in {remaining}s  "
+                f"(attempt {retry_count}/{self.MAX_RETRIES})"))
+            time.sleep(1)
+        if self._stop.is_set():
+            return False
+        self._pq.put(("status", entry_id,
+            f"Reconnecting…  (attempt {retry_count}/{self.MAX_RETRIES})"))
+        return True
+
     def run(self):
         entry_id = self._entry.id
         request = None
@@ -403,13 +423,20 @@ class UploadWorker:
             # connection.  httplib2 is NOT thread-safe — sharing a single
             # service across concurrent workers corrupts OpenSSL buffers,
             # which macOS 26's xzone malloc allocator detects as a crash.
+            self._pq.put(("status", entry_id, "Connecting…"))
             if self._account_id and drive_accounts.token_path(self._account_id).exists():
                 service = drive_accounts.build_thread_service(self._account_id)
             else:
                 service = drivelib.build_thread_service()
 
+            # Check stop before making any Drive API requests
+            if self._stop.is_set():
+                self._pq.put(("cancelled", entry_id, None))
+                return
+
             if self._entry.resumable_uri:
                 # Resume an existing session
+                self._pq.put(("status", entry_id, "Querying server for progress…"))
                 request, wrapper, confirmed = drivelib.restore_upload_request(
                     service,
                     self._entry.local_path,
@@ -424,6 +451,7 @@ class UploadWorker:
                 self._pq.put(("confirmed", entry_id, confirmed))
             else:
                 # Start a fresh session
+                self._pq.put(("status", entry_id, "Starting upload…"))
                 request, wrapper = drivelib.create_upload_request(
                     service,
                     self._entry.local_path,
@@ -454,7 +482,7 @@ class UploadWorker:
                     # User clicked pause — save session and exit cleanly
                     saved_uri = (request.resumable_uri if request else None) or self._entry.resumable_uri
                     saved_progress = (request.resumable_progress if request else None) or 0
-                    self._state.update(entry_id, status="queued",
+                    self._state.update(entry_id, status="paused",
                                        resumable_uri=saved_uri,
                                        resumable_progress=saved_progress)
                     self._pq.put(("cancelled", entry_id, None))
@@ -466,7 +494,14 @@ class UploadWorker:
                     if retry_count > self.MAX_RETRIES:
                         raise
                     self._pq.put(("retrying", entry_id, retry_count))
-                    time.sleep(min(2 ** (retry_count - 1), 16))
+                    if not self._countdown_retry(entry_id, retry_count):
+                        saved_uri = (request.resumable_uri if request else None) or self._entry.resumable_uri
+                        saved_progress = (request.resumable_progress if request else None) or 0
+                        self._state.update(entry_id, status="paused",
+                                           resumable_uri=saved_uri,
+                                           resumable_progress=saved_progress)
+                        self._pq.put(("cancelled", entry_id, None))
+                        return
 
                 except HttpError as e:
                     if e.resp.status in self.RETRY_STATUS_CODES:
@@ -474,7 +509,14 @@ class UploadWorker:
                         if retry_count > self.MAX_RETRIES:
                             raise
                         self._pq.put(("retrying", entry_id, retry_count))
-                        time.sleep(min(2 ** (retry_count - 1), 16))
+                        if not self._countdown_retry(entry_id, retry_count):
+                            saved_uri = (request.resumable_uri if request else None) or self._entry.resumable_uri
+                            saved_progress = (request.resumable_progress if request else None) or 0
+                            self._state.update(entry_id, status="paused",
+                                               resumable_uri=saved_uri,
+                                               resumable_progress=saved_progress)
+                            self._pq.put(("cancelled", entry_id, None))
+                            return
                     else:
                         raise
 
@@ -490,7 +532,7 @@ class UploadWorker:
 
         except StopRequested:
             # Stop was set before the first chunk even started
-            self._state.update(entry_id, status="queued",
+            self._state.update(entry_id, status="paused",
                                resumable_uri=self._entry.resumable_uri,
                                resumable_progress=self._entry.resumable_progress)
             self._pq.put(("cancelled", entry_id, None))
@@ -520,19 +562,23 @@ class ZipWorker:
     """Compresses a local folder to a temp ZIP, then signals the upload queue.
 
     Progress events:
-      ("zip_progress", entry_id, n_done, n_total)
-      ("zip_done",     entry_id, zip_path, zip_size, zip_name)
-      ("error",        entry_id, error_msg)
+      ("zip_progress",  entry_id, n_done, n_total)
+      ("zip_done",      entry_id, zip_path, zip_size, zip_name)
+      ("zip_cancelled", entry_id)
+      ("error",         entry_id, error_msg)
     """
 
     def __init__(self, folder_path: str, entry_id: str,
-                 state: StateManager, pq: queue.Queue):
+                 state: StateManager, pq: queue.Queue,
+                 stop_event: threading.Event | None = None):
         self._folder = folder_path
         self._entry_id = entry_id
         self._state = state
         self._pq = pq
+        self._stop = stop_event or threading.Event()
 
     def run(self):
+        tmp_dir = None
         try:
             folder_name = Path(self._folder).name
             tmp_dir = tempfile.mkdtemp(prefix="drive-uploader-")
@@ -549,6 +595,8 @@ class ZipWorker:
             # deflation gains nothing but wastes CPU. Pure I/O, ~10x faster.
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                 for i, fp in enumerate(all_files):
+                    if self._stop.is_set():
+                        raise _ZipCancelled()
                     arcname = os.path.relpath(fp, folder_parent)
                     zf.write(fp, arcname)
                     self._pq.put(("zip_progress", self._entry_id, i + 1, len(all_files)))
@@ -564,9 +612,22 @@ class ZipWorker:
                                is_temp_zip=True)
             self._pq.put(("zip_done", self._entry_id, zip_path, zip_size, zip_name))
 
+        except _ZipCancelled:
+            # Clean up partial zip
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._state.update(self._entry_id, status="failed", error="Cancelled")
+            self._pq.put(("zip_cancelled", self._entry_id))
+
         except Exception as e:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             self._state.update(self._entry_id, status="failed", error=str(e))
             self._pq.put(("error", self._entry_id, str(e)))
+
+
+class _ZipCancelled(Exception):
+    """Internal sentinel — raised when ZipWorker stop_event is set."""
 
 
 # ── Upload Row ────────────────────────────────────────────────────────────────
@@ -633,6 +694,8 @@ class UploadRowFrame(ctk.CTkFrame):
             self._set_badge("Uploading", ACCENT, TEXT)
         elif entry.status == "compressing":
             self._set_badge("Compressing", YELLOW, "#1c1c1e")
+        elif entry.status == "paused":
+            self.set_paused()
         elif entry.status == "completed":
             self.set_done()
         elif entry.status == "failed":
@@ -684,10 +747,18 @@ class UploadRowFrame(ctk.CTkFrame):
             text = f"{done} / {total} ({pct}%)"
         self._stats.configure(text=text, text_color=TEXT2)
 
+    def set_status(self, text: str):
+        """Update stats line with live status text (overwritten by next progress event)."""
+        self._stats.configure(text=text, text_color=TEXT2)
+
     def set_retrying(self, attempt: int):
+        """Badge only — stats line driven by per-second countdown via set_status."""
         self._set_badge(f"Retry {attempt}/5", YELLOW, "#1c1c1e")
-        self._stats.configure(
-            text=f"Network error — retrying (attempt {attempt}/5)…", text_color=YELLOW)
+
+    def set_zip_cancelling(self):
+        """Immediate visual feedback when user cancels a compressing row."""
+        self._set_badge("Cancelling…", BG3, TEXT2)
+        self._cancel_btn.configure(state="disabled", text="…")
 
     def set_done(self):
         self._bytes_display = self._file_size
@@ -738,9 +809,9 @@ class UploadRowFrame(ctk.CTkFrame):
         self._rate_samples.clear()
         self._rate = 0.0
         self._set_badge("Uploading", ACCENT, TEXT)
-        # Restore cancel button (may have been a resume ▶ button)
+        # Restore pause button (may have been a resume ▶ button)
         self._cancel_btn.configure(
-            text="✕", fg_color=BG3, hover_color=RED, text_color=TEXT2,
+            text="⏸", fg_color=BG3, hover_color=YELLOW, text_color=TEXT2,
             state="normal",
             command=lambda: self._cancel_callback(self._entry_id),
         )
@@ -1193,6 +1264,7 @@ class App(ctk.CTk):
         self._folders = []
         self._progress_queue: queue.Queue = queue.Queue()
         self._active_workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
+        self._active_zip_workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self._observer: Observer | None = None
         self._export_handler: ExportHandler | None = None
 
@@ -1445,6 +1517,10 @@ class App(ctk.CTk):
 
         def do_resume():
             dlg.destroy()
+            # Reset in_progress → queued (crash-recovery) and paused → queued
+            for entry in pending:
+                if entry.status in ("in_progress", "paused"):
+                    self._state.update(entry.id, status="queued")
             # Build queue rows lazily so the main thread stays responsive
             self._add_rows_batch(pending, idx=0)
             # Workers start automatically once _init_drive finishes
@@ -1607,8 +1683,11 @@ class App(ctk.CTk):
         row = self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
         row.set_zip_progress(0, 1)  # show initial compressing state
 
-        worker = ZipWorker(folder_path, entry.id, self._state, self._progress_queue)
+        stop_event = threading.Event()
+        worker = ZipWorker(folder_path, entry.id, self._state, self._progress_queue,
+                           stop_event=stop_event)
         t = threading.Thread(target=worker.run, daemon=True)
+        self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
 
     def _add_folder_as_structure(self, folder_path: str):
@@ -1707,10 +1786,17 @@ class App(ctk.CTk):
         row.set_uploading()
 
     def _cancel_upload(self, entry_id: str):
-        if entry_id in self._active_workers:
+        if entry_id in self._active_zip_workers:
+            # Compressing — signal zip thread and show immediate feedback
+            _, stop_event = self._active_zip_workers[entry_id]
+            stop_event.set()
+            row = self._queue_frame.get_row(entry_id)
+            if row:
+                row.set_zip_cancelling()
+        elif entry_id in self._active_workers:
+            # Uploading — signal upload thread and show immediate feedback
             _, stop_event = self._active_workers[entry_id]
             stop_event.set()
-            # Immediate visual feedback — don't wait for worker to confirm via queue
             row = self._queue_frame.get_row(entry_id)
             if row:
                 row.set_pausing()
@@ -1725,11 +1811,11 @@ class App(ctk.CTk):
         """Resume a paused upload in the current session."""
         if entry_id in self._active_workers:
             return  # already running
+        # Move from "paused" back to "queued" so _start_next_uploads picks it up
+        self._state.update(entry_id, status="queued")
         row = self._queue_frame.get_row(entry_id)
         if row:
-            # Immediately switch button back to ✕ so user sees the response
-            row.set_uploading()
-        # State is already "queued" with resumable_uri saved — kick the scheduler
+            row.set_queued()
         self._start_next_uploads()
 
     # ── Progress polling ──────────────────────────────────────────────────
@@ -1775,15 +1861,25 @@ class App(ctk.CTk):
                         row.set_paused()
                     self._start_next_uploads()
 
+                elif kind == "status":
+                    if row:
+                        row.set_status(msg[2])
+
                 elif kind == "zip_progress":
                     if row:
                         row.set_zip_progress(msg[2], msg[3])
 
                 elif kind == "zip_done":
+                    self._active_zip_workers.pop(entry_id, None)
                     zip_path, zip_size, zip_name = msg[2], msg[3], msg[4]
                     if row:
                         row.set_upload_ready(zip_name, zip_size)
                     self._start_next_uploads()
+
+                elif kind == "zip_cancelled":
+                    self._active_zip_workers.pop(entry_id, None)
+                    if row:
+                        row.set_failed("Cancelled")
 
         except queue.Empty:
             pass
@@ -2007,8 +2103,11 @@ class App(ctk.CTk):
     def _on_close(self):
         # Stop watchdog observer cleanly before exit
         self._stop_watching()
-        # Signal all active workers to stop (they save state before exiting)
-        for entry_id, (thread, stop_event) in list(self._active_workers.items()):
+        # Signal all active workers to stop (upload workers save state before exiting)
+        for _, (thread, stop_event) in list(self._active_workers.items()):
+            stop_event.set()
+        # Signal any running zip workers to abort
+        for _, (thread, stop_event) in list(self._active_zip_workers.items()):
             stop_event.set()
         self.destroy()
 
