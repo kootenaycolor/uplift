@@ -13,6 +13,7 @@ DEFAULTS = {
     "drive_folder_id": "",
     "drive_folder_name": "",
     "active_drive_account_id": "",
+    "last_browse_dir": "/Volumes",
     # Export Watch
     "watch_enabled": False,
     "watch_folder": "",

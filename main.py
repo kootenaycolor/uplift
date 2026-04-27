@@ -1681,10 +1681,13 @@ class App(ctk.CTk):
         if paths is None:
             paths = filedialog.askopenfilenames(
                 title="Select files to upload",
-                initialdir="/Volumes",
+                initialdir=self._cfg.get("last_browse_dir", "/Volumes"),
             )
         if not paths:
             return
+        # Remember the directory for next time
+        self._cfg["last_browse_dir"] = str(Path(paths[0]).parent)
+        config.save(self._cfg)
         folder_id = self._cfg["drive_folder_id"]
         folder_name = self._cfg["drive_folder_name"]
         added = 0
@@ -1706,10 +1709,13 @@ class App(ctk.CTk):
             return
         folder_path = filedialog.askdirectory(
             title="Select folder to upload",
-            initialdir="/Volumes",
+            initialdir=self._cfg.get("last_browse_dir", "/Volumes"),
         )
         if not folder_path:
             return
+        # Remember the parent directory for next time
+        self._cfg["last_browse_dir"] = str(Path(folder_path).parent)
+        config.save(self._cfg)
 
         folder_name = Path(folder_path).name
         dlg = FolderModeDialog(self, folder_name)
