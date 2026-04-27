@@ -630,6 +630,174 @@ class _ZipCancelled(Exception):
     """Internal sentinel — raised when ZipWorker stop_event is set."""
 
 
+# ── Email Chip Entry ─────────────────────────────────────────────────────────
+
+class EmailChipEntry(ctk.CTkFrame):
+    """Email address chip/bubble input.
+
+    Press Enter or type ',' to commit current text as a chip.
+    Backspace on empty input removes the last chip.
+    get() returns comma-separated string of all addresses.
+    set(value) populates from a comma-separated string.
+    """
+
+    CHIP_BG  = "#1a3d6b"   # dark blue pill
+    CHIP_FG  = "#f2f2f7"   # TEXT
+
+    def __init__(self, parent, initial: str = "", placeholder: str = "",
+                 on_change=None, **kw):
+        super().__init__(parent, fg_color=BG3, corner_radius=6,
+                         border_color=BORDER, border_width=1, **kw)
+        self._chips: list[str]       = []
+        self._chip_frames: list      = []
+        self._on_change              = on_change
+        self._placeholder            = placeholder
+        self._has_placeholder        = False
+
+        # Raw tk Frame so we can embed raw tk widgets with matching bg
+        self._inner = tk.Frame(self, bg=BG3)
+        self._inner.pack(fill="both", expand=True, padx=5, pady=3)
+
+        self._entry_var = tk.StringVar()
+        self._entry = tk.Entry(
+            self._inner,
+            textvariable=self._entry_var,
+            bg=BG3, fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat", bd=0,
+            highlightthickness=0,
+            font=("SF Pro Text", 12),
+        )
+        self._entry.pack(side="left", fill="x", expand=True, ipady=2)
+
+        self._entry.bind("<Return>",   self._commit)
+        self._entry.bind("<Key>",      self._on_key)
+        self._entry.bind("<BackSpace>", self._on_backspace)
+        self._entry.bind("<FocusIn>",  self._on_focus_in)
+        self._entry.bind("<FocusOut>", self._on_focus_out)
+
+        # Click anywhere on the widget focuses the entry
+        self.bind("<Button-1>",        lambda _: self._entry.focus_set())
+        self._inner.bind("<Button-1>", lambda _: self._entry.focus_set())
+
+        if initial:
+            self.set(initial)
+        elif placeholder:
+            self._show_placeholder()
+
+    # ── Placeholder ──────────────────────────────────────────────────────────
+
+    def _show_placeholder(self):
+        if not self._chips:
+            self._entry_var.set(self._placeholder)
+            self._entry.config(fg=TEXT2)
+            self._has_placeholder = True
+
+    def _hide_placeholder(self):
+        if self._has_placeholder:
+            self._entry_var.set("")
+            self._entry.config(fg=TEXT)
+            self._has_placeholder = False
+
+    def _on_focus_in(self, _):
+        self._hide_placeholder()
+
+    def _on_focus_out(self, _):
+        if not self._entry_var.get().strip() and not self._chips:
+            self._show_placeholder()
+
+    # ── Input handling ───────────────────────────────────────────────────────
+
+    def _on_key(self, event):
+        if event.char == ",":
+            self._commit()
+            return "break"
+
+    def _on_backspace(self, event):
+        if not self._entry_var.get() and self._chips:
+            self._remove_chip_by_index(-1)
+            return "break"
+
+    def _commit(self, event=None):
+        text = self._entry_var.get().strip().rstrip(",").strip()
+        if text and not self._has_placeholder:
+            self._add_chip(text)
+            self._entry_var.set("")
+        return "break"
+
+    # ── Chip management ──────────────────────────────────────────────────────
+
+    def _add_chip(self, email: str):
+        if email in self._chips:
+            return
+        self._chips.append(email)
+
+        chip = tk.Frame(self._inner, bg=self.CHIP_BG, padx=0, pady=0)
+        chip.pack(side="left", padx=(0, 4), before=self._entry)
+
+        tk.Label(chip, text=email, bg=self.CHIP_BG, fg=self.CHIP_FG,
+                 font=("SF Pro Text", 11), padx=6, pady=1).pack(side="left")
+
+        idx = len(self._chips) - 1
+        tk.Button(chip, text="×", bg=self.CHIP_BG, fg=TEXT2,
+                  activebackground=self.CHIP_BG, activeforeground=RED,
+                  relief="flat", bd=0, padx=3, pady=0,
+                  cursor="hand2", font=("SF Pro Text", 13),
+                  command=lambda e=email, c=chip: self._remove_chip(e, c)
+                  ).pack(side="left", padx=(0, 3))
+
+        self._chip_frames.append(chip)
+        if self._on_change:
+            self._on_change()
+
+    def _remove_chip(self, email: str, frame):
+        if email in self._chips:
+            idx = self._chips.index(email)
+            self._chips.pop(idx)
+            self._chip_frames.pop(idx)
+        frame.destroy()
+        if self._on_change:
+            self._on_change()
+
+    def _remove_chip_by_index(self, idx: int):
+        if not self._chips:
+            return
+        email = self._chips[idx]
+        frame = self._chip_frames[idx]
+        self._chips.pop(idx)
+        self._chip_frames.pop(idx)
+        frame.destroy()
+        if self._on_change:
+            self._on_change()
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def get(self) -> str:
+        """Return comma-separated emails (chips + uncommitted text)."""
+        parts = list(self._chips)
+        current = self._entry_var.get().strip()
+        if current and not self._has_placeholder:
+            parts.append(current)
+        return ", ".join(parts)
+
+    def set(self, value: str):
+        """Populate from a comma-separated string."""
+        for f in self._chip_frames:
+            f.destroy()
+        self._chips.clear()
+        self._chip_frames.clear()
+        self._entry_var.set("")
+        self._has_placeholder = False
+        emails = [e.strip() for e in value.split(",") if e.strip()]
+        for email in emails:
+            self._add_chip(email)
+        if not emails and self._placeholder:
+            self._show_placeholder()
+
+    def focus(self):
+        self._entry.focus_set()
+
+
 # ── Upload Row ────────────────────────────────────────────────────────────────
 
 class UploadRowFrame(ctk.CTkFrame):
@@ -1429,34 +1597,37 @@ class App(ctk.CTk):
         to_row.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(to_row, text="To", font=FONT_LABEL, text_color=TEXT2,
                      width=44, anchor="w").pack(side="left")
-        self._recipient_var = ctk.StringVar(value=self._cfg.get("recipient_email", ""))
-        ctk.CTkEntry(to_row, textvariable=self._recipient_var,
-                     placeholder_text="client@example.com, other@example.com",
-                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
-                     height=30, corner_radius=6).pack(side="left", fill="x", expand=True)
-        self._recipient_var.trace_add("write", self._on_recipient_change)
+        self._to_chips = EmailChipEntry(
+            to_row,
+            initial=self._cfg.get("recipient_email", ""),
+            placeholder="client@example.com",
+            on_change=self._on_to_change,
+        )
+        self._to_chips.pack(side="left", fill="x", expand=True)
 
         cc_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
         cc_row.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(cc_row, text="CC", font=FONT_LABEL, text_color=TEXT2,
                      width=44, anchor="w").pack(side="left")
-        self._cc_var = ctk.StringVar(value=self._cfg.get("recipient_cc", ""))
-        ctk.CTkEntry(cc_row, textvariable=self._cc_var,
-                     placeholder_text="optional, comma-separated",
-                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
-                     height=30, corner_radius=6).pack(side="left", fill="x", expand=True)
-        self._cc_var.trace_add("write", self._on_cc_change)
+        self._cc_chips = EmailChipEntry(
+            cc_row,
+            initial=self._cfg.get("recipient_cc", ""),
+            placeholder="optional",
+            on_change=self._on_cc_change,
+        )
+        self._cc_chips.pack(side="left", fill="x", expand=True)
 
         bcc_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
         bcc_row.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(bcc_row, text="BCC", font=FONT_LABEL, text_color=TEXT2,
                      width=44, anchor="w").pack(side="left")
-        self._bcc_var = ctk.StringVar(value=self._cfg.get("recipient_bcc", ""))
-        ctk.CTkEntry(bcc_row, textvariable=self._bcc_var,
-                     placeholder_text="optional, comma-separated",
-                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
-                     height=30, corner_radius=6).pack(side="left", fill="x", expand=True)
-        self._bcc_var.trace_add("write", self._on_bcc_change)
+        self._bcc_chips = EmailChipEntry(
+            bcc_row,
+            initial=self._cfg.get("recipient_bcc", ""),
+            placeholder="optional",
+            on_change=self._on_bcc_change,
+        )
+        self._bcc_chips.pack(side="left", fill="x", expand=True)
 
         from_row = ctk.CTkFrame(self._email_body, fg_color="transparent")
         from_row.pack(fill="x", pady=(0, 4))
@@ -2072,16 +2243,16 @@ class App(ctk.CTk):
         else:
             self._email_body.pack_forget()
 
-    def _on_recipient_change(self, *_):
-        self._cfg["recipient_email"] = self._recipient_var.get()
+    def _on_to_change(self):
+        self._cfg["recipient_email"] = self._to_chips.get()
         config.save(self._cfg)
 
-    def _on_cc_change(self, *_):
-        self._cfg["recipient_cc"] = self._cc_var.get()
+    def _on_cc_change(self):
+        self._cfg["recipient_cc"] = self._cc_chips.get()
         config.save(self._cfg)
 
-    def _on_bcc_change(self, *_):
-        self._cfg["recipient_bcc"] = self._bcc_var.get()
+    def _on_bcc_change(self):
+        self._cfg["recipient_bcc"] = self._bcc_chips.get()
         config.save(self._cfg)
 
     def _on_auto_send_change(self):
