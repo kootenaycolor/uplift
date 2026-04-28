@@ -65,6 +65,8 @@ FONT_SMALL = ("SF Pro Text", 10)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mxf", ".r3d", ".braw", ".mkv", ".avi", ".prores", ".dng"}
 
+LOG_PATH = Path.home() / ".uplift-log.txt"
+
 MAX_CONCURRENT = 1  # serialized — OpenSSL 3.x has a thread-safety bug that
                      # macOS 26's xzone malloc allocator catches as heap corruption
                      # when multiple SSL connections operate concurrently
@@ -630,6 +632,65 @@ class _ZipCancelled(Exception):
     """Internal sentinel — raised when ZipWorker stop_event is set."""
 
 
+class ListZipWorker:
+    """Compress an arbitrary list of file paths into one ZIP.
+
+    Like ZipWorker but takes individual files instead of a directory.
+    Files are stored with a flat structure (filename only, no path prefix).
+    Used by the Export Watch batch-zip feature.
+
+    Progress events mirror ZipWorker:
+      ("zip_progress",  entry_id, n_done, n_total)
+      ("zip_done",      entry_id, zip_path, zip_size, zip_name)
+      ("zip_cancelled", entry_id)
+      ("error",         entry_id, error_msg)
+    """
+
+    def __init__(self, file_paths: list[str], zip_name: str, entry_id: str,
+                 state: StateManager, pq: queue.Queue,
+                 stop_event: threading.Event | None = None):
+        self._files = file_paths
+        self._zip_name = zip_name
+        self._entry_id = entry_id
+        self._state = state
+        self._pq = pq
+        self._stop = stop_event or threading.Event()
+
+    def run(self):
+        tmp_dir = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="uplift-")
+            zip_path = os.path.join(tmp_dir, self._zip_name)
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+                for i, fp in enumerate(self._files):
+                    if self._stop.is_set():
+                        raise _ZipCancelled()
+                    arcname = Path(fp).name  # flat structure
+                    zf.write(fp, arcname)
+                    self._pq.put(("zip_progress", self._entry_id, i + 1, len(self._files)))
+
+            zip_size = os.path.getsize(zip_path)
+            self._state.update(self._entry_id,
+                               status="queued",
+                               local_path=zip_path,
+                               file_name=self._zip_name,
+                               file_size=zip_size,
+                               is_temp_zip=True)
+            self._pq.put(("zip_done", self._entry_id, zip_path, zip_size, self._zip_name))
+
+        except _ZipCancelled:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._state.update(self._entry_id, status="failed", error="Cancelled")
+            self._pq.put(("zip_cancelled", self._entry_id))
+
+        except Exception as e:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._state.update(self._entry_id, status="failed", error=str(e))
+            self._pq.put(("error", self._entry_id, str(e)))
+
+
 # ── Email Chip Entry ─────────────────────────────────────────────────────────
 
 class EmailChipEntry(ctk.CTkFrame):
@@ -1097,15 +1158,28 @@ class UploadQueueFrame(ctk.CTkScrollableFrame):
                          scrollbar_button_hover_color=BORDER)
         self._rows: dict[str, UploadRowFrame] = {}        # entry_id → row
         self._group_headers: dict[str, FolderGroupRow] = {}  # group_id → header
+        # Bind scroll wheel on the frame itself
+        self._bind_scroll_on(self)
+
+    def _scroll(self, event):
+        self._parent_canvas.yview_scroll(int(-event.delta / 60), "units")
+
+    def _bind_scroll_on(self, widget):
+        """Recursively bind mouse-wheel scroll so hover over any child widget scrolls the list."""
+        widget.bind("<MouseWheel>", self._scroll, add="+")
+        for child in widget.winfo_children():
+            self._bind_scroll_on(child)
 
     def add_group_header(self, group_id: str, group_name: str, n_total: int):
         if group_id not in self._group_headers:
             header = FolderGroupRow(self, group_name, n_total)
             self._group_headers[group_id] = header
+            self.after(20, lambda h=header: self._bind_scroll_on(h))
 
     def add_row(self, entry: UploadEntry, cancel_callback, resume_callback=None) -> UploadRowFrame:
         row = UploadRowFrame(self, entry, cancel_callback, resume_callback)
         self._rows[entry.id] = row
+        self.after(20, lambda r=row: self._bind_scroll_on(r))
         return row
 
     def get_row(self, entry_id: str) -> UploadRowFrame | None:
@@ -1506,6 +1580,11 @@ class App(ctk.CTk):
         self._active_zip_workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self._observer: Observer | None = None
         self._export_handler: ExportHandler | None = None
+        # Batch-zip state (export watch)
+        self._batch_files: list[str] = []
+        self._batch_timer_id: str | None = None
+        # Manual email send
+        self._pending_email: tuple | None = None  # (UploadEntry, drive_file_id)
 
         self._build_ui()
         self._restore_panel_states()
@@ -1608,7 +1687,32 @@ class App(ctk.CTk):
 
         self._watch_status_label = ctk.CTkLabel(
             self._watch_body, text="", font=FONT_SMALL, text_color=TEXT2, anchor="w")
-        self._watch_status_label.pack(fill="x", pady=(2, 10))
+        self._watch_status_label.pack(fill="x", pady=(2, 4))
+
+        # Batch-zip option
+        batch_row = ctk.CTkFrame(self._watch_body, fg_color="transparent")
+        batch_row.pack(fill="x", pady=(0, 10))
+        self._batch_mode_var = ctk.BooleanVar(
+            value=bool(self._cfg.get("watch_batch_mode", False)))
+        ctk.CTkCheckBox(
+            batch_row,
+            text="Batch zip — wait until burst is done, then zip & upload together",
+            variable=self._batch_mode_var,
+            font=FONT_LABEL, text_color=TEXT2,
+            fg_color=ACCENT, hover_color="#0060df",
+            command=self._on_batch_mode_change,
+        ).pack(side="left")
+        ctk.CTkLabel(batch_row, text="Idle timeout:", font=FONT_LABEL,
+                     text_color=TEXT2).pack(side="left", padx=(16, 4))
+        self._batch_idle_var = ctk.StringVar(
+            value=str(self._cfg.get("watch_batch_idle_secs", 60)))
+        ctk.CTkEntry(
+            batch_row, textvariable=self._batch_idle_var, width=52, height=26,
+            fg_color=BG3, border_color=BORDER, text_color=TEXT,
+            corner_radius=6,
+        ).pack(side="left")
+        ctk.CTkLabel(batch_row, text="s", font=FONT_LABEL,
+                     text_color=TEXT2).pack(side="left", padx=(4, 0))
 
         # ── Email Notification panel ──────────────────────────────────────────
         self._email_card = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
@@ -1687,6 +1791,14 @@ class App(ctk.CTk):
             fg_color=ACCENT, hover_color="#0060df",
             command=self._on_auto_send_change,
         ).pack(side="left")
+        # Manual send button — enabled when auto-send is OFF and a completed upload is pending
+        self._send_now_btn = ctk.CTkButton(
+            bottom_row, text="Send Now", width=82, height=28, corner_radius=6,
+            fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+            font=FONT_SMALL, state="disabled",
+            command=self._send_email_now,
+        )
+        self._send_now_btn.pack(side="left", padx=(10, 0))
         ctk.CTkButton(
             bottom_row, text="Template…", width=90, height=28, corner_radius=6,
             fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
@@ -1710,6 +1822,10 @@ class App(ctk.CTk):
         ctk.CTkButton(btn_row, text="Clear Completed", height=36, corner_radius=8,
                       fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
                       command=self._clear_completed).pack(side="right")
+        ctk.CTkButton(btn_row, text="📋 Log", height=36, corner_radius=8,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+                      font=FONT_SMALL,
+                      command=self._view_log).pack(side="right", padx=(0, 8))
 
         divider(self).pack(fill="x", padx=24, pady=12)
 
@@ -1907,6 +2023,7 @@ class App(ctk.CTk):
             entry = UploadEntry.new(path, size, folder_id, folder_name)
             if self._state.add(entry):
                 self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
+                self._log(f"Queued: {Path(path).name}  ({_fmt_size(size)})")
                 added += 1
         if added:
             self._start_next_uploads()
@@ -2181,8 +2298,16 @@ class App(ctk.CTk):
                 _, _, n_done, n_total = self._state.get_group_progress(entry.group_id)
                 hdr.update_count(n_done)
 
+        # Log the completed upload
+        if entry:
+            self._log(f"Upload complete: {entry.file_name}")
+
         # Email notification (background thread)
         if self._cfg.get("email_enabled") and drive_file_id and entry:
+            # Track for manual send when auto-send is off
+            self._pending_email = (entry, drive_file_id)
+            if not self._cfg.get("auto_send_email") and hasattr(self, "_send_now_btn"):
+                self._send_now_btn.configure(state="normal")
             threading.Thread(
                 target=self._post_upload_email,
                 args=(entry, drive_file_id),
@@ -2194,8 +2319,10 @@ class App(ctk.CTk):
     def _on_upload_error(self, entry_id: str, error_msg: str):
         self._active_workers.pop(entry_id, None)
         row = self._queue_frame.get_row(entry_id)
+        entry = self._state.get(entry_id)
         if row:
             row.set_failed(error_msg)
+        self._log(f"Upload error: {entry.file_name if entry else entry_id} — {error_msg}")
         self._start_next_uploads()
 
     # ── UI actions ────────────────────────────────────────────────────────
@@ -2264,12 +2391,33 @@ class App(ctk.CTk):
             self._observer.join(timeout=2)
             self._observer = None
         self._export_handler = None
+        # Cancel any pending batch timer
+        if self._batch_timer_id:
+            self.after_cancel(self._batch_timer_id)
+            self._batch_timer_id = None
+        self._batch_files.clear()
         if hasattr(self, "_watch_status_label"):
             self._watch_status_label.configure(text="Stopped", text_color=TEXT2)
 
     def _on_export_ready(self, path: str):
         """Called from watchdog thread when export file size is stable."""
-        self.after(0, lambda: self._add_files([path]))
+        def _handle():
+            if self._cfg.get("watch_batch_mode"):
+                # Accumulate files; reset the idle timer
+                self._batch_files.append(path)
+                if self._batch_timer_id:
+                    self.after_cancel(self._batch_timer_id)
+                idle_ms = int(self._cfg.get("watch_batch_idle_secs", 60)) * 1000
+                self._batch_timer_id = self.after(idle_ms, self._finalize_batch)
+                n = len(self._batch_files)
+                self._watch_status_label.configure(
+                    text=f"●  Collecting  •  {n} file{'s' if n != 1 else ''} — idle timer reset",
+                    text_color=YELLOW)
+                self._log(f"Export ready (batch): {Path(path).name}  ({n} collected so far)")
+            else:
+                self._add_files([path])
+                self._log(f"Export ready: {Path(path).name}")
+        self.after(0, _handle)
 
     # ── Email Notification ────────────────────────────────────────────────────
 
@@ -2295,8 +2443,139 @@ class App(ctk.CTk):
         config.save(self._cfg)
 
     def _on_auto_send_change(self):
-        self._cfg["auto_send_email"] = bool(self._auto_send_var.get())
+        auto = bool(self._auto_send_var.get())
+        self._cfg["auto_send_email"] = auto
         config.save(self._cfg)
+        # Enable Send Now button when auto-send is OFF and there's a pending upload
+        if hasattr(self, "_send_now_btn"):
+            can_send = (not auto) and (self._pending_email is not None)
+            self._send_now_btn.configure(state="normal" if can_send else "disabled")
+
+    def _send_email_now(self):
+        """Manually send email for the last completed upload."""
+        if not self._pending_email:
+            return
+        entry, drive_file_id = self._pending_email
+        self._pending_email = None
+        self._send_now_btn.configure(state="disabled")
+        threading.Thread(
+            target=self._post_upload_email,
+            args=(entry, drive_file_id, True),   # force_send=True
+            daemon=True,
+        ).start()
+
+    def _on_batch_mode_change(self):
+        self._cfg["watch_batch_mode"] = bool(self._batch_mode_var.get())
+        try:
+            self._cfg["watch_batch_idle_secs"] = int(self._batch_idle_var.get())
+        except ValueError:
+            pass
+        config.save(self._cfg)
+        # Cancel any running batch timer when mode changes
+        if self._batch_timer_id:
+            self.after_cancel(self._batch_timer_id)
+            self._batch_timer_id = None
+        self._batch_files.clear()
+
+    def _finalize_batch(self):
+        """Idle timeout fired — zip all accumulated files and queue the upload."""
+        self._batch_timer_id = None
+        if not self._batch_files:
+            return
+        files = list(self._batch_files)
+        self._batch_files.clear()
+
+        watch_folder = self._cfg.get("watch_folder", "")
+        folder_name = Path(watch_folder).name if watch_folder else "batch"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_name = f"{folder_name}_{ts}.zip"
+
+        folder_id   = self._cfg.get("drive_folder_id", "")
+        folder_dest = self._cfg.get("drive_folder_name", "")
+        if not folder_id:
+            self._watch_status_label.configure(
+                text="⚠  No Drive folder selected — batch zip not queued", text_color=RED)
+            return
+
+        entry = UploadEntry.new(
+            local_path="",
+            file_size=0,
+            folder_id=folder_id,
+            folder_name=folder_dest,
+            status="compressing",
+        )
+        entry.file_name = zip_name
+        self._state.add(entry)
+
+        row = self._queue_frame.add_row(entry, self._cancel_upload, self._resume_upload)
+        row.set_zip_progress(0, 1)
+
+        stop_event = threading.Event()
+        worker = ListZipWorker(files, zip_name, entry.id, self._state,
+                               self._progress_queue, stop_event=stop_event)
+        t = threading.Thread(target=worker.run, daemon=True)
+        self._active_zip_workers[entry.id] = (t, stop_event)
+        t.start()
+
+        # Restore watching status
+        name = Path(watch_folder).name if watch_folder else "?"
+        self._watch_status_label.configure(
+            text=f"●  Watching  •  {name}", text_color=GREEN)
+        self._log(f"Batch zip started: {len(files)} file(s) → {zip_name}")
+
+    def _log(self, message: str):
+        """Append a timestamped line to the activity log file."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}]  {message}\n"
+        try:
+            with LOG_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+
+    def _view_log(self):
+        """Open a dialog showing the activity log."""
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Activity Log")
+        dlg.geometry("640x420")
+        dlg.configure(fg_color=BG)
+        dlg.grab_set()
+        dlg.lift()
+        dlg.after(50, dlg.lift)
+
+        hdr = ctk.CTkFrame(dlg, fg_color="transparent")
+        hdr.pack(fill="x", padx=16, pady=(12, 0))
+        ctk.CTkLabel(hdr, text="Activity Log", font=FONT_TITLE, text_color=TEXT).pack(side="left")
+        ctk.CTkButton(hdr, text="Clear", width=64, height=28, corner_radius=6,
+                      fg_color=RED, hover_color="#cc2a20", text_color=TEXT,
+                      font=FONT_SMALL, command=lambda: _clear_log()).pack(side="right")
+
+        box = ctk.CTkTextbox(dlg, font=("SF Mono", 10), text_color=TEXT2,
+                             fg_color=BG2, corner_radius=8, wrap="none")
+        box.pack(fill="both", expand=True, padx=16, pady=12)
+
+        def _load():
+            box.configure(state="normal")
+            box.delete("0.0", "end")
+            if LOG_PATH.exists():
+                try:
+                    content = LOG_PATH.read_text(encoding="utf-8")
+                    box.insert("end", content)
+                    box.see("end")
+                except OSError:
+                    box.insert("end", "(error reading log file)")
+            else:
+                box.insert("end", "(no log entries yet)")
+            box.configure(state="disabled")
+
+        def _clear_log():
+            try:
+                LOG_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _load()
+
+        _load()
 
     def _setup_sender(self):
         account_id = self._cfg.get("active_drive_account_id", "")
@@ -2330,7 +2609,7 @@ class App(ctk.CTk):
         else:
             self._sender_label.configure(text="— not set up —", text_color=TEXT2)
 
-    def _post_upload_email(self, entry: UploadEntry, drive_file_id: str):
+    def _post_upload_email(self, entry: UploadEntry, drive_file_id: str, force_send: bool = False):
         """Background thread: make file shareable, send email if configured."""
         try:
             account_id = self._cfg.get("active_drive_account_id", "")
@@ -2351,7 +2630,7 @@ class App(ctk.CTk):
             ).execute()
             link = result.get("webViewLink", "")
 
-            if not self._cfg.get("auto_send_email"):
+            if not self._cfg.get("auto_send_email") and not force_send:
                 return  # share link created but auto-send is off
 
             recipient = self._cfg.get("recipient_email", "").strip()
@@ -2397,11 +2676,15 @@ class App(ctk.CTk):
                 cc=cc,
                 bcc=bcc,
             )
+            _recipient_log = recipient
+            _fname_log = entry.file_name
+            self._log(f"Email sent: {_fname_log} → {_recipient_log}")
             self.after(0, lambda: self._show_notice(
                 f"✓ Email sent to {recipient}\nfor {entry.file_name}"))
 
         except Exception as e:
             err = str(e)
+            self._log(f"Email failed: {entry.file_name} — {err}")
             self.after(0, lambda: self._show_notice(f"Email notification failed:\n{err}"))
 
     # ── Window close ──────────────────────────────────────────────────────

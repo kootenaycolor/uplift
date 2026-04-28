@@ -19,6 +19,8 @@ DEFAULTS = {
     # Export Watch
     "watch_enabled": False,
     "watch_folder": "",
+    "watch_batch_mode": False,
+    "watch_batch_idle_secs": 60,
     # Email Notification
     "email_enabled": False,
     "recipient_email": "",       # comma-separated To addresses
