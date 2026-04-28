@@ -1468,7 +1468,7 @@ class EmailSetupDialog(ctk.CTkToplevel):
 # ── Email Template Dialog ─────────────────────────────────────────────────────
 
 class EmailTemplateDialog(ctk.CTkToplevel):
-    """Edit email subject and body template, optionally scoped to a Drive account."""
+    """Edit email subject/body template — either global default or per-Drive-account."""
 
     DEFAULT_SUBJECT = "Your file is ready: {filename}"
     DEFAULT_BODY = (
@@ -1481,8 +1481,7 @@ class EmailTemplateDialog(ctk.CTkToplevel):
 
     def __init__(self, parent, cfg: dict, account_id: str = "", account_name: str = ""):
         super().__init__(parent)
-        self.title("Email Template")
-        self.geometry("480x440")
+        self.geometry("500x480")
         self.configure(fg_color=BG)
         self.resizable(False, True)
         self.grab_set()
@@ -1490,20 +1489,47 @@ class EmailTemplateDialog(ctk.CTkToplevel):
         self.after(50, self.lift)
         self._cfg = cfg
         self._account_id = account_id
+        self._parent_app = parent  # for opening global default sub-dialog
 
-        # Per-account template dict (or empty if no account)
-        acct_tmpl = cfg.get("account_templates", {}).get(account_id, {}) if account_id else {}
+        if account_id:
+            # Per-account: show what's currently saved for this account (may be empty → uses global)
+            acct_tmpl = cfg.get("account_templates", {}).get(account_id, {})
+            global_subj = cfg.get("email_subject", self.DEFAULT_SUBJECT)
+            global_body = cfg.get("email_body", self.DEFAULT_BODY)
+            has_override = bool(acct_tmpl)
 
-        title_text = f"Email Template — {account_name}" if account_name else "Email Template"
-        ctk.CTkLabel(self, text=title_text,
-                     font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 4))
+            self.title(f"Template — {account_name or account_id}")
+            ctk.CTkLabel(self, text=f"Template — {account_name or 'Account'}",
+                         font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 2))
+            ctk.CTkLabel(self,
+                         text=f"Custom template for this Drive account only.\n"
+                              f"Leave as-is or clear override to inherit the global default.",
+                         font=FONT_SMALL, text_color=TEXT2,
+                         justify="center").pack(padx=20, pady=(0, 4))
+
+            init_subj = acct_tmpl.get("email_subject", global_subj)
+            init_body = acct_tmpl.get("email_body",  global_body)
+        else:
+            # Global default — used by any account without a custom override
+            acct_tmpl = {}
+            global_subj = cfg.get("email_subject", self.DEFAULT_SUBJECT)
+            global_body = cfg.get("email_body", self.DEFAULT_BODY)
+            has_override = False
+
+            self.title("Template — Global Default")
+            ctk.CTkLabel(self, text="Template — Global Default",
+                         font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 2))
+            ctk.CTkLabel(self,
+                         text="Used by accounts that don't have a custom template set.",
+                         font=FONT_SMALL, text_color=TEXT2,
+                         justify="center").pack(padx=20, pady=(0, 4))
+
+            init_subj = global_subj
+            init_body = global_body
+
         ctk.CTkLabel(self,
                      text="Variables:  {filename}  {link}  {date}  {sender_name}",
-                     font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 12))
-        if account_id:
-            ctk.CTkLabel(self,
-                         text="This template overrides the default for this account only.",
-                         font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 8))
+                     font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 8))
 
         form = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
                             border_color=BORDER, border_width=1)
@@ -1513,9 +1539,7 @@ class EmailTemplateDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(form, text="Subject", font=FONT_LABEL, text_color=TEXT2,
                      anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(12, 6), sticky="nw")
-        self._subject_var = ctk.StringVar(
-            value=acct_tmpl.get("email_subject",
-                  cfg.get("email_subject", self.DEFAULT_SUBJECT)))
+        self._subject_var = ctk.StringVar(value=init_subj)
         ctk.CTkEntry(form, textvariable=self._subject_var,
                      fg_color=BG3, border_color=BORDER, text_color=TEXT,
                      height=32, corner_radius=6).grid(
@@ -1527,14 +1551,26 @@ class EmailTemplateDialog(ctk.CTkToplevel):
             form, fg_color=BG3, border_color=BORDER, border_width=1,
             text_color=TEXT, font=("SF Pro Text", 12), corner_radius=6, wrap="word")
         self._body_box.grid(row=1, column=1, padx=(0, 14), pady=(6, 12), sticky="nsew")
-        self._body_box.insert("0.0", acct_tmpl.get("email_body",
-                              cfg.get("email_body", self.DEFAULT_BODY)))
+        self._body_box.insert("0.0", init_body)
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(padx=20, pady=(8, 16), fill="x")
-        ctk.CTkButton(btn_row, text="Reset to Default", width=130, height=34,
-                      corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
-                      command=self._reset).pack(side="left")
+
+        if account_id:
+            # Clear Override — removes account-specific template (falls back to global)
+            ctk.CTkButton(btn_row, text="Clear Override", width=110, height=34,
+                          corner_radius=8, fg_color=RED, hover_color="#cc2a20", text_color=TEXT,
+                          command=self._clear_override).pack(side="left")
+            # Reset to Global — loads the global values into the fields without saving
+            ctk.CTkButton(btn_row, text="← Global Default", width=120, height=34,
+                          corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+                          command=lambda: self._load_global()).pack(side="left", padx=(8, 0))
+        else:
+            # Global default dialog — reset to hardcoded defaults
+            ctk.CTkButton(btn_row, text="Reset to Default", width=130, height=34,
+                          corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+                          command=self._reset_to_hardcoded).pack(side="left")
+
         ctk.CTkButton(btn_row, text="Cancel", width=80, height=34, corner_radius=8,
                       fg_color=BG3, hover_color=BORDER, text_color=TEXT,
                       command=self.destroy).pack(side="right", padx=(8, 0))
@@ -1542,11 +1578,29 @@ class EmailTemplateDialog(ctk.CTkToplevel):
                       fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
                       command=self._save).pack(side="right")
 
+    def _load_global(self):
+        """Load global default values into fields (without saving)."""
+        self._subject_var.set(self._cfg.get("email_subject", self.DEFAULT_SUBJECT))
+        self._body_box.delete("0.0", "end")
+        self._body_box.insert("0.0", self._cfg.get("email_body", self.DEFAULT_BODY))
+
+    def _clear_override(self):
+        """Remove account-specific template — account will use the global default."""
+        templates = self._cfg.get("account_templates", {})
+        templates.pop(self._account_id, None)
+        self._cfg["account_templates"] = templates
+        config.save(self._cfg)
+        self.destroy()
+
+    def _reset_to_hardcoded(self):
+        self._subject_var.set(self.DEFAULT_SUBJECT)
+        self._body_box.delete("0.0", "end")
+        self._body_box.insert("0.0", self.DEFAULT_BODY)
+
     def _save(self):
         subject = self._subject_var.get().strip()
         body = self._body_box.get("0.0", "end").rstrip("\n")
         if self._account_id:
-            # Save to per-account template slot
             templates = self._cfg.setdefault("account_templates", {})
             templates[self._account_id] = {"email_subject": subject, "email_body": body}
         else:
@@ -1554,11 +1608,6 @@ class EmailTemplateDialog(ctk.CTkToplevel):
             self._cfg["email_body"] = body
         config.save(self._cfg)
         self.destroy()
-
-    def _reset(self):
-        self._subject_var.set(self.DEFAULT_SUBJECT)
-        self._body_box.delete("0.0", "end")
-        self._body_box.insert("0.0", self.DEFAULT_BODY)
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -1722,6 +1771,18 @@ class App(ctk.CTk):
         email_hdr = ctk.CTkFrame(self._email_card, fg_color="transparent")
         email_hdr.pack(fill="x", padx=16, pady=10)
         section_label(email_hdr, "Email Notification").pack(side="left", pady=2)
+        ctk.CTkButton(
+            email_hdr, text="Template…", width=82, height=26, corner_radius=6,
+            fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+            font=FONT_SMALL,
+            command=self._edit_template,
+        ).pack(side="right", padx=(0, 8))
+        ctk.CTkButton(
+            email_hdr, text="Global…", width=60, height=26, corner_radius=6,
+            fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+            font=FONT_SMALL,
+            command=self._edit_global_template,
+        ).pack(side="right", padx=(0, 4))
         self._email_switch = ctk.CTkSwitch(
             email_hdr, text="", width=46, height=24,
             button_color=ACCENT, button_hover_color="#0060df",
@@ -1799,12 +1860,6 @@ class App(ctk.CTk):
             command=self._send_email_now,
         )
         self._send_now_btn.pack(side="left", padx=(10, 0))
-        ctk.CTkButton(
-            bottom_row, text="Template…", width=90, height=28, corner_radius=6,
-            fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
-            font=FONT_SMALL,
-            command=self._edit_template,
-        ).pack(side="right")
 
         divider(self).pack(fill="x", padx=24, pady=(4, 12))
 
@@ -2594,9 +2649,14 @@ class App(ctk.CTk):
         if account_id:
             acct = drive_accounts.get_account(account_id)
             if acct:
-                account_name = acct.get("name", "")
+                account_name = acct.get("name", "") or acct.get("email", "")
         dlg = EmailTemplateDialog(self, self._cfg, account_id=account_id,
                                   account_name=account_name)
+        self.wait_window(dlg)
+
+    def _edit_global_template(self):
+        """Open template dialog scoped to global default (no account)."""
+        dlg = EmailTemplateDialog(self, self._cfg, account_id="", account_name="")
         self.wait_window(dlg)
 
     def _update_sender_label(self):
