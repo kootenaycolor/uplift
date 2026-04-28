@@ -833,8 +833,9 @@ class UploadRowFrame(ctk.CTkFrame):
                      font=FONT_SMALL, text_color=TEXT2).pack(side="right")
 
         # ── Middle row: progress bar + status badge + cancel ──
-        mid = ctk.CTkFrame(self, fg_color="transparent")
-        mid.pack(fill="x", padx=14, pady=3)
+        self._mid = ctk.CTkFrame(self, fg_color="transparent")
+        self._mid.pack(fill="x", padx=14, pady=3)
+        mid = self._mid
 
         self._bar = ctk.CTkProgressBar(mid, height=8, corner_radius=4,
                                         fg_color=BG3, progress_color=ACCENT)
@@ -877,7 +878,9 @@ class UploadRowFrame(ctk.CTkFrame):
         elif entry.status == "paused":
             self.set_paused()
         elif entry.status == "completed":
-            self.set_done()
+            _wl = (f"https://drive.google.com/file/d/{entry.drive_file_id}/view"
+                   if entry.drive_file_id else "")
+            self.set_done(web_link=_wl)
         elif entry.status == "failed":
             self.set_failed(entry.error or "Unknown error")
 
@@ -942,7 +945,7 @@ class UploadRowFrame(ctk.CTkFrame):
         self._set_badge("Cancelling…", BG3, TEXT2)
         self._cancel_btn.configure(state="disabled", text="…")
 
-    def set_done(self):
+    def set_done(self, web_link: str = ""):
         self._bytes_display = self._file_size
         self._bytes_confirmed = self._file_size
         self._bar.set(1.0)
@@ -953,6 +956,22 @@ class UploadRowFrame(ctk.CTkFrame):
                                     fg_color=BG3, hover_color=BG3, text_color=GREEN)
         self._stats.configure(text=f"{_fmt_size(self._file_size)} uploaded successfully",
                               text_color=GREEN)
+        if web_link:
+            self._link_url = web_link
+            self._copy_btn = ctk.CTkButton(
+                self._mid, text="⎘", width=28, height=26, corner_radius=6,
+                fg_color=BG3, hover_color=ACCENT, text_color=TEXT2,
+                font=("SF Pro Text", 13),
+                command=self._copy_link,
+            )
+            self._copy_btn.pack(side="left", padx=(4, 0))
+            self._open_btn = ctk.CTkButton(
+                self._mid, text="↗", width=28, height=26, corner_radius=6,
+                fg_color=BG3, hover_color=ACCENT, text_color=TEXT2,
+                font=("SF Pro Text", 13),
+                command=self._open_link,
+            )
+            self._open_btn.pack(side="left", padx=(2, 0))
 
     def set_pausing(self):
         """Immediate visual feedback when user clicks cancel — before worker confirms."""
@@ -1009,6 +1028,17 @@ class UploadRowFrame(ctk.CTkFrame):
         self._cancel_btn.configure(state="disabled")
         short = msg if len(msg) < 65 else msg[:63] + "…"
         self._stats.configure(text=f"Error: {short}", text_color=RED)
+
+    def _copy_link(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._link_url)
+        self._copy_btn.configure(text="✓", fg_color=GREEN, text_color="#1c1c1e")
+        self.after(1500, lambda: self._copy_btn.configure(
+            text="⎘", fg_color=BG3, text_color=TEXT2))
+
+    def _open_link(self):
+        import webbrowser
+        webbrowser.open(self._link_url)
 
     def set_zip_progress(self, done: int, total: int):
         frac = done / total if total else 0
@@ -1276,9 +1306,11 @@ class AddAccountDialog(ctk.CTkToplevel):
 class EmailSetupDialog(ctk.CTkToplevel):
     """Collect Gmail sender identity and App Password, save to profile."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, account_id: str = "", account_name: str = ""):
         super().__init__(parent)
-        self.title("Email Setup")
+        self._account_id = account_id
+        title = f"Email Setup — {account_name}" if account_name else "Email Setup"
+        self.title(title)
         self.geometry("420x310")
         self.configure(fg_color=BG)
         self.resizable(False, False)
@@ -1286,7 +1318,8 @@ class EmailSetupDialog(ctk.CTkToplevel):
         self.lift()
         self.after(50, self.lift)
 
-        ctk.CTkLabel(self, text="Email Sender Setup",
+        heading = f"Email Sender — {account_name}" if account_name else "Email Sender Setup"
+        ctk.CTkLabel(self, text=heading,
                      font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 4))
         ctk.CTkLabel(self,
                      text="Uses Gmail SMTP with an App Password\n"
@@ -1298,7 +1331,7 @@ class EmailSetupDialog(ctk.CTkToplevel):
         form.pack(fill="x", padx=20)
         form.columnconfigure(1, weight=1)
 
-        existing = sender_profile.load() or {}
+        existing = sender_profile.load(account_id) or {}
 
         ctk.CTkLabel(form, text="Name", font=FONT_LABEL, text_color=TEXT2,
                      anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(12, 6), sticky="w")
@@ -1350,11 +1383,11 @@ class EmailSetupDialog(ctk.CTkToplevel):
         if not name or not email or not pw:
             self._status.configure(text="All fields are required.")
             return
-        sender_profile.save(name, email, pw)
+        sender_profile.save(self._account_id, name, email, pw)
         self.destroy()
 
     def _clear(self):
-        sender_profile.clear()
+        sender_profile.clear(self._account_id)
         self.destroy()
 
 
@@ -1830,6 +1863,7 @@ class App(ctk.CTk):
         if dlg.account_changed:
             config.save(self._cfg)
             self._update_account_label()
+            self._update_sender_label()
             threading.Thread(target=self._init_drive, daemon=True).start()
 
     # ── Folder picker ─────────────────────────────────────────────────────
@@ -2125,8 +2159,10 @@ class App(ctk.CTk):
     def _on_upload_done(self, entry_id: str, drive_file_id: str):
         self._active_workers.pop(entry_id, None)
         row = self._queue_frame.get_row(entry_id)
+        web_link = (f"https://drive.google.com/file/d/{drive_file_id}/view"
+                    if drive_file_id else "")
         if row:
-            row.set_done()
+            row.set_done(web_link=web_link)
 
         # Clean up temp ZIP if applicable
         entry = self._state.get(entry_id)
@@ -2263,7 +2299,13 @@ class App(ctk.CTk):
         config.save(self._cfg)
 
     def _setup_sender(self):
-        dlg = EmailSetupDialog(self)
+        account_id = self._cfg.get("active_drive_account_id", "")
+        account_name = ""
+        if account_id:
+            acct = drive_accounts.get_account(account_id)
+            if acct:
+                account_name = acct.get("name", "")
+        dlg = EmailSetupDialog(self, account_id=account_id, account_name=account_name)
         self.wait_window(dlg)
         self._update_sender_label()
 
@@ -2279,7 +2321,8 @@ class App(ctk.CTk):
         self.wait_window(dlg)
 
     def _update_sender_label(self):
-        prof = sender_profile.load()
+        account_id = self._cfg.get("active_drive_account_id", "")
+        prof = sender_profile.load(account_id)
         if prof and prof.get("sender_name"):
             self._sender_label.configure(
                 text=f"{prof['sender_name']} <{prof['sender_email']}>",
@@ -2315,7 +2358,7 @@ class App(ctk.CTk):
             if not recipient:
                 return
 
-            prof = sender_profile.load()
+            prof = sender_profile.load(account_id)
             if not prof or not prof.get("gmail_app_password"):
                 self.after(0, lambda: self._show_notice(
                     "Email notification enabled but sender not configured.\n"
@@ -2323,7 +2366,6 @@ class App(ctk.CTk):
                 return
 
             # Per-account template overrides global template
-            account_id = self._cfg.get("active_drive_account_id", "")
             acct_tmpl = self._cfg.get("account_templates", {}).get(account_id, {})
 
             from datetime import date as _date
