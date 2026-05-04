@@ -319,6 +319,84 @@ class FolderModeDialog(ctk.CTkToplevel):
 
 # ── Export Watch Handler ──────────────────────────────────────────────────────
 
+class FolderBatchMonitor:
+    """Polls a watch folder until every video file is completely static, then fires.
+
+    Instead of a fixed idle-timer (reset per file), this watches the folder as a
+    whole: once ALL video files have the same size for `stable_secs` consecutive
+    seconds and no new files have appeared, it calls `on_stable(file_list)`.
+
+    Files in `skip_paths` are ignored (already batched in a previous round).
+    After the batch fires, call `restart(new_skip_paths)` to watch for the next burst.
+    """
+
+    POLL_INTERVAL = 3  # seconds between folder snapshots
+
+    def __init__(self, folder: str, stable_secs: int,
+                 on_stable, on_status=None, skip_paths: set | None = None):
+        self._folder = Path(folder)
+        self._stable_secs = stable_secs
+        self._on_stable = on_stable
+        self._on_status = on_status or (lambda msg, color: None)
+        self._skip_paths: set[str] = set(skip_paths or [])
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="FolderBatchMonitor")
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _snapshot(self) -> dict[str, int] | None:
+        try:
+            return {
+                str(f): f.stat().st_size
+                for f in self._folder.iterdir()
+                if f.is_file()
+                and f.suffix.lower() in VIDEO_EXTENSIONS
+                and str(f) not in self._skip_paths
+            }
+        except OSError:
+            return None
+
+    def _run(self):
+        prev: dict | None = None
+        stable_ticks = 0
+        needed = max(1, self._stable_secs // self.POLL_INTERVAL)
+
+        # wait() returns True when stop is set, False on timeout
+        while not self._stop_event.wait(self.POLL_INTERVAL):
+            snap = self._snapshot()
+            if snap is None:
+                continue  # folder temporarily unreadable
+
+            n = len(snap)
+            if n == 0:
+                stable_ticks = 0
+                prev = None
+                self._on_status("●  Watching — no video files yet", "dim")
+                continue
+
+            if snap == prev:
+                stable_ticks += 1
+                elapsed = stable_ticks * self.POLL_INTERVAL
+                if stable_ticks >= needed:
+                    self._on_status(
+                        f"●  {n} file{'s' if n!=1 else ''} stable — zipping…", "green")
+                    self._on_stable(list(snap.keys()))
+                    return
+                self._on_status(
+                    f"●  {n} file{'s' if n!=1 else ''} stable "
+                    f"{elapsed}s / {self._stable_secs}s…", "yellow")
+            else:
+                stable_ticks = 0
+                prev = snap
+                self._on_status(
+                    f"●  {n} file{'s' if n!=1 else ''} exporting…", "yellow")
+
+
 class ExportHandler(FileSystemEventHandler):
     """Watchdog handler: waits for video file size to stabilize, then queues upload."""
 
@@ -1468,7 +1546,12 @@ class EmailSetupDialog(ctk.CTkToplevel):
 # ── Email Template Dialog ─────────────────────────────────────────────────────
 
 class EmailTemplateDialog(ctk.CTkToplevel):
-    """Edit email subject/body template — either global default or per-Drive-account."""
+    """Edit the email template for the active Drive account.
+
+    Each Drive account stores its own subject + body template in
+    cfg["account_templates"][account_id].  Saving here writes directly to
+    that account's slot.  "Reset to Default" restores the hardcoded defaults.
+    """
 
     DEFAULT_SUBJECT = "Your file is ready: {filename}"
     DEFAULT_BODY = (
@@ -1481,7 +1564,7 @@ class EmailTemplateDialog(ctk.CTkToplevel):
 
     def __init__(self, parent, cfg: dict, account_id: str = "", account_name: str = ""):
         super().__init__(parent)
-        self.geometry("500x480")
+        self.geometry("500x440")
         self.configure(fg_color=BG)
         self.resizable(False, True)
         self.grab_set()
@@ -1489,47 +1572,20 @@ class EmailTemplateDialog(ctk.CTkToplevel):
         self.after(50, self.lift)
         self._cfg = cfg
         self._account_id = account_id
-        self._parent_app = parent  # for opening global default sub-dialog
 
-        if account_id:
-            # Per-account: show what's currently saved for this account (may be empty → uses global)
-            acct_tmpl = cfg.get("account_templates", {}).get(account_id, {})
-            global_subj = cfg.get("email_subject", self.DEFAULT_SUBJECT)
-            global_body = cfg.get("email_body", self.DEFAULT_BODY)
-            has_override = bool(acct_tmpl)
+        label = account_name or (account_id[:24] if account_id else "Default")
+        self.title(f"Email Template — {label}")
 
-            self.title(f"Template — {account_name or account_id}")
-            ctk.CTkLabel(self, text=f"Template — {account_name or 'Account'}",
-                         font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 2))
-            ctk.CTkLabel(self,
-                         text=f"Custom template for this Drive account only.\n"
-                              f"Leave as-is or clear override to inherit the global default.",
-                         font=FONT_SMALL, text_color=TEXT2,
-                         justify="center").pack(padx=20, pady=(0, 4))
-
-            init_subj = acct_tmpl.get("email_subject", global_subj)
-            init_body = acct_tmpl.get("email_body",  global_body)
-        else:
-            # Global default — used by any account without a custom override
-            acct_tmpl = {}
-            global_subj = cfg.get("email_subject", self.DEFAULT_SUBJECT)
-            global_body = cfg.get("email_body", self.DEFAULT_BODY)
-            has_override = False
-
-            self.title("Template — Global Default")
-            ctk.CTkLabel(self, text="Template — Global Default",
-                         font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 2))
-            ctk.CTkLabel(self,
-                         text="Used by accounts that don't have a custom template set.",
-                         font=FONT_SMALL, text_color=TEXT2,
-                         justify="center").pack(padx=20, pady=(0, 4))
-
-            init_subj = global_subj
-            init_body = global_body
-
+        ctk.CTkLabel(self, text=f"Email Template — {label}",
+                     font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 2))
         ctk.CTkLabel(self,
                      text="Variables:  {filename}  {link}  {date}  {sender_name}",
-                     font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 8))
+                     font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 10))
+
+        # Load current saved template for this account, fall back to hardcoded
+        acct_tmpl = cfg.get("account_templates", {}).get(account_id, {})
+        init_subj = acct_tmpl.get("email_subject", self.DEFAULT_SUBJECT)
+        init_body = acct_tmpl.get("email_body",    self.DEFAULT_BODY)
 
         form = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
                             border_color=BORDER, border_width=1)
@@ -1555,22 +1611,9 @@ class EmailTemplateDialog(ctk.CTkToplevel):
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(padx=20, pady=(8, 16), fill="x")
-
-        if account_id:
-            # Clear Override — removes account-specific template (falls back to global)
-            ctk.CTkButton(btn_row, text="Clear Override", width=110, height=34,
-                          corner_radius=8, fg_color=RED, hover_color="#cc2a20", text_color=TEXT,
-                          command=self._clear_override).pack(side="left")
-            # Reset to Global — loads the global values into the fields without saving
-            ctk.CTkButton(btn_row, text="← Global Default", width=120, height=34,
-                          corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
-                          command=lambda: self._load_global()).pack(side="left", padx=(8, 0))
-        else:
-            # Global default dialog — reset to hardcoded defaults
-            ctk.CTkButton(btn_row, text="Reset to Default", width=130, height=34,
-                          corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
-                          command=self._reset_to_hardcoded).pack(side="left")
-
+        ctk.CTkButton(btn_row, text="Reset to Default", width=130, height=34,
+                      corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+                      command=self._reset).pack(side="left")
         ctk.CTkButton(btn_row, text="Cancel", width=80, height=34, corner_radius=8,
                       fg_color=BG3, hover_color=BORDER, text_color=TEXT,
                       command=self.destroy).pack(side="right", padx=(8, 0))
@@ -1578,21 +1621,7 @@ class EmailTemplateDialog(ctk.CTkToplevel):
                       fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
                       command=self._save).pack(side="right")
 
-    def _load_global(self):
-        """Load global default values into fields (without saving)."""
-        self._subject_var.set(self._cfg.get("email_subject", self.DEFAULT_SUBJECT))
-        self._body_box.delete("0.0", "end")
-        self._body_box.insert("0.0", self._cfg.get("email_body", self.DEFAULT_BODY))
-
-    def _clear_override(self):
-        """Remove account-specific template — account will use the global default."""
-        templates = self._cfg.get("account_templates", {})
-        templates.pop(self._account_id, None)
-        self._cfg["account_templates"] = templates
-        config.save(self._cfg)
-        self.destroy()
-
-    def _reset_to_hardcoded(self):
+    def _reset(self):
         self._subject_var.set(self.DEFAULT_SUBJECT)
         self._body_box.delete("0.0", "end")
         self._body_box.insert("0.0", self.DEFAULT_BODY)
@@ -1600,14 +1629,85 @@ class EmailTemplateDialog(ctk.CTkToplevel):
     def _save(self):
         subject = self._subject_var.get().strip()
         body = self._body_box.get("0.0", "end").rstrip("\n")
-        if self._account_id:
-            templates = self._cfg.setdefault("account_templates", {})
-            templates[self._account_id] = {"email_subject": subject, "email_body": body}
-        else:
-            self._cfg["email_subject"] = subject
-            self._cfg["email_body"] = body
+        templates = self._cfg.setdefault("account_templates", {})
+        templates[self._account_id] = {"email_subject": subject, "email_body": body}
         config.save(self._cfg)
         self.destroy()
+
+
+# ── Email Compose Dialog ──────────────────────────────────────────────────────
+
+class ComposeEmailDialog(ctk.CTkToplevel):
+    """Pre-filled from account template; user can edit before sending.
+
+    Note: {link} in the body is shown as-is here — it will be replaced
+    with the real Drive share URL when the email is actually sent.
+    """
+
+    def __init__(self, parent, subject: str, body: str, on_send):
+        super().__init__(parent)
+        self.title("Compose Email")
+        self.geometry("520x480")
+        self.configure(fg_color=BG)
+        self.resizable(False, True)
+        self.grab_set()
+        self.lift()
+        self.after(50, self.lift)
+
+        self._orig_subject = subject
+        self._orig_body = body
+        self._on_send = on_send
+
+        ctk.CTkLabel(self, text="Compose Email",
+                     font=FONT_TITLE, text_color=TEXT).pack(padx=20, pady=(20, 2))
+        ctk.CTkLabel(self,
+                     text="{link} will be replaced with the Drive share URL when sent.",
+                     font=FONT_SMALL, text_color=TEXT2).pack(padx=20, pady=(0, 10))
+
+        form = ctk.CTkFrame(self, fg_color=BG2, corner_radius=10,
+                            border_color=BORDER, border_width=1)
+        form.pack(fill="both", expand=True, padx=20)
+        form.columnconfigure(1, weight=1)
+        form.rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Subject", font=FONT_LABEL, text_color=TEXT2,
+                     anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(12, 6), sticky="nw")
+        self._subject_var = ctk.StringVar(value=subject)
+        ctk.CTkEntry(form, textvariable=self._subject_var,
+                     fg_color=BG3, border_color=BORDER, text_color=TEXT,
+                     height=32, corner_radius=6).grid(
+                         row=0, column=1, padx=(0, 14), pady=(12, 6), sticky="ew")
+
+        ctk.CTkLabel(form, text="Body", font=FONT_LABEL, text_color=TEXT2,
+                     anchor="w").grid(row=1, column=0, padx=(14, 8), pady=(6, 12), sticky="nw")
+        self._body_box = ctk.CTkTextbox(
+            form, fg_color=BG3, border_color=BORDER, border_width=1,
+            text_color=TEXT, font=("SF Pro Text", 12), corner_radius=6, wrap="word")
+        self._body_box.grid(row=1, column=1, padx=(0, 14), pady=(6, 12), sticky="nsew")
+        self._body_box.insert("0.0", body)
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(padx=20, pady=(8, 16), fill="x")
+        ctk.CTkButton(btn_row, text="← Revert to Template", width=150, height=34,
+                      corner_radius=8, fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
+                      command=self._revert).pack(side="left")
+        ctk.CTkButton(btn_row, text="Cancel", width=80, height=34, corner_radius=8,
+                      fg_color=BG3, hover_color=BORDER, text_color=TEXT,
+                      command=self.destroy).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Send", width=80, height=34, corner_radius=8,
+                      fg_color=ACCENT, hover_color="#0060df", text_color=TEXT,
+                      command=self._send).pack(side="right")
+
+    def _revert(self):
+        self._subject_var.set(self._orig_subject)
+        self._body_box.delete("0.0", "end")
+        self._body_box.insert("0.0", self._orig_body)
+
+    def _send(self):
+        subject = self._subject_var.get().strip()
+        body = self._body_box.get("0.0", "end").rstrip("\n")
+        self.destroy()
+        self._on_send(subject, body)
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -1630,8 +1730,8 @@ class App(ctk.CTk):
         self._observer: Observer | None = None
         self._export_handler: ExportHandler | None = None
         # Batch-zip state (export watch)
-        self._batch_files: list[str] = []
-        self._batch_timer_id: str | None = None
+        self._folder_monitor: FolderBatchMonitor | None = None
+        self._batched_paths: set[str] = set()  # paths already included in a batch
         # Manual email send
         self._pending_email: tuple | None = None  # (UploadEntry, drive_file_id)
 
@@ -1745,16 +1845,16 @@ class App(ctk.CTk):
             value=bool(self._cfg.get("watch_batch_mode", False)))
         ctk.CTkCheckBox(
             batch_row,
-            text="Batch zip — wait until burst is done, then zip & upload together",
+            text="Batch zip — waits for all exports to finish, then zips & uploads",
             variable=self._batch_mode_var,
             font=FONT_LABEL, text_color=TEXT2,
             fg_color=ACCENT, hover_color="#0060df",
             command=self._on_batch_mode_change,
         ).pack(side="left")
-        ctk.CTkLabel(batch_row, text="Idle timeout:", font=FONT_LABEL,
+        ctk.CTkLabel(batch_row, text="Stable for:", font=FONT_LABEL,
                      text_color=TEXT2).pack(side="left", padx=(16, 4))
         self._batch_idle_var = ctk.StringVar(
-            value=str(self._cfg.get("watch_batch_idle_secs", 60)))
+            value=str(self._cfg.get("watch_batch_stable_secs", 15)))
         ctk.CTkEntry(
             batch_row, textvariable=self._batch_idle_var, width=52, height=26,
             fg_color=BG3, border_color=BORDER, text_color=TEXT,
@@ -1772,17 +1872,11 @@ class App(ctk.CTk):
         email_hdr.pack(fill="x", padx=16, pady=10)
         section_label(email_hdr, "Email Notification").pack(side="left", pady=2)
         ctk.CTkButton(
-            email_hdr, text="Template…", width=82, height=26, corner_radius=6,
+            email_hdr, text="Template…", width=86, height=26, corner_radius=6,
             fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
             font=FONT_SMALL,
             command=self._edit_template,
         ).pack(side="right", padx=(0, 8))
-        ctk.CTkButton(
-            email_hdr, text="Global…", width=60, height=26, corner_radius=6,
-            fg_color=BG3, hover_color=BORDER, text_color=TEXT2,
-            font=FONT_SMALL,
-            command=self._edit_global_template,
-        ).pack(side="right", padx=(0, 4))
         self._email_switch = ctk.CTkSwitch(
             email_hdr, text="", width=46, height=24,
             button_color=ACCENT, button_hover_color="#0060df",
@@ -2439,6 +2533,29 @@ class App(ctk.CTk):
         name = Path(folder).name
         self._watch_status_label.configure(
             text=f"●  Watching  •  {name}", text_color=GREEN)
+        if self._cfg.get("watch_batch_mode"):
+            self._start_folder_monitor(folder)
+
+    def _start_folder_monitor(self, folder: str):
+        """Spin up FolderBatchMonitor for batch mode."""
+        if self._folder_monitor:
+            self._folder_monitor.stop()
+        stable_secs = int(self._cfg.get("watch_batch_stable_secs", 15))
+        self._folder_monitor = FolderBatchMonitor(
+            folder=folder,
+            stable_secs=stable_secs,
+            on_stable=lambda files: self.after(0, lambda: self._finalize_batch(files)),
+            on_status=self._on_batch_status,
+            skip_paths=set(self._batched_paths),
+        )
+        self._folder_monitor.start()
+
+    def _on_batch_status(self, msg: str, level: str):
+        """Called from FolderBatchMonitor thread — marshal to UI thread."""
+        color_map = {"green": GREEN, "yellow": YELLOW, "dim": TEXT2}
+        color = color_map.get(level, TEXT2)
+        self.after(0, lambda: self._watch_status_label.configure(
+            text=msg, text_color=color))
 
     def _stop_watching(self):
         if self._observer:
@@ -2446,29 +2563,19 @@ class App(ctk.CTk):
             self._observer.join(timeout=2)
             self._observer = None
         self._export_handler = None
-        # Cancel any pending batch timer
-        if self._batch_timer_id:
-            self.after_cancel(self._batch_timer_id)
-            self._batch_timer_id = None
-        self._batch_files.clear()
+        if self._folder_monitor:
+            self._folder_monitor.stop()
+            self._folder_monitor = None
+        self._batched_paths.clear()
         if hasattr(self, "_watch_status_label"):
             self._watch_status_label.configure(text="Stopped", text_color=TEXT2)
 
     def _on_export_ready(self, path: str):
-        """Called from watchdog thread when export file size is stable."""
+        """Called from watchdog thread when a single export file size is stable."""
         def _handle():
             if self._cfg.get("watch_batch_mode"):
-                # Accumulate files; reset the idle timer
-                self._batch_files.append(path)
-                if self._batch_timer_id:
-                    self.after_cancel(self._batch_timer_id)
-                idle_ms = int(self._cfg.get("watch_batch_idle_secs", 60)) * 1000
-                self._batch_timer_id = self.after(idle_ms, self._finalize_batch)
-                n = len(self._batch_files)
-                self._watch_status_label.configure(
-                    text=f"●  Collecting  •  {n} file{'s' if n != 1 else ''} — idle timer reset",
-                    text_color=YELLOW)
-                self._log(f"Export ready (batch): {Path(path).name}  ({n} collected so far)")
+                # FolderBatchMonitor drives the batch — just log the detection
+                self._log(f"Export detected (batch mode): {Path(path).name}")
             else:
                 self._add_files([path])
                 self._log(f"Export ready: {Path(path).name}")
@@ -2507,38 +2614,61 @@ class App(ctk.CTk):
             self._send_now_btn.configure(state="normal" if can_send else "disabled")
 
     def _send_email_now(self):
-        """Manually send email for the last completed upload."""
+        """Open compose dialog pre-filled from account template, then send."""
         if not self._pending_email:
             return
         entry, drive_file_id = self._pending_email
-        self._pending_email = None
-        self._send_now_btn.configure(state="disabled")
-        threading.Thread(
-            target=self._post_upload_email,
-            args=(entry, drive_file_id, True),   # force_send=True
-            daemon=True,
-        ).start()
+
+        # Build template preview (substitute everything except {link})
+        account_id = self._cfg.get("active_drive_account_id", "")
+        prof = sender_profile.load(account_id) or {}
+        acct_tmpl = self._cfg.get("account_templates", {}).get(account_id, {})
+        from datetime import date as _date
+        subs = {
+            "filename": entry.file_name,
+            "link": "{link}",   # substituted with real URL after share API call
+            "date": _date.today().strftime("%B %d, %Y"),
+            "sender_name": prof.get("sender_name", ""),
+        }
+        DEFAULT_SUBJECT = EmailTemplateDialog.DEFAULT_SUBJECT
+        DEFAULT_BODY    = EmailTemplateDialog.DEFAULT_BODY
+        subject = acct_tmpl.get("email_subject",
+                  self._cfg.get("email_subject", DEFAULT_SUBJECT)).format_map(subs)
+        body    = acct_tmpl.get("email_body",
+                  self._cfg.get("email_body",    DEFAULT_BODY)).format_map(subs)
+
+        def _on_send_confirmed(edited_subj: str, edited_body: str):
+            self._pending_email = None
+            self._send_now_btn.configure(state="disabled")
+            threading.Thread(
+                target=self._post_upload_email,
+                args=(entry, drive_file_id, True, edited_subj, edited_body),
+                daemon=True,
+            ).start()
+
+        ComposeEmailDialog(self, subject=subject, body=body, on_send=_on_send_confirmed)
 
     def _on_batch_mode_change(self):
-        self._cfg["watch_batch_mode"] = bool(self._batch_mode_var.get())
+        enabled = bool(self._batch_mode_var.get())
+        self._cfg["watch_batch_mode"] = enabled
         try:
-            self._cfg["watch_batch_idle_secs"] = int(self._batch_idle_var.get())
+            self._cfg["watch_batch_stable_secs"] = int(self._batch_idle_var.get())
         except ValueError:
             pass
         config.save(self._cfg)
-        # Cancel any running batch timer when mode changes
-        if self._batch_timer_id:
-            self.after_cancel(self._batch_timer_id)
-            self._batch_timer_id = None
-        self._batch_files.clear()
+        # Start or stop folder monitor based on new mode
+        folder = self._cfg.get("watch_folder", "").strip()
+        if enabled and folder and Path(folder).is_dir() and self._observer:
+            self._start_folder_monitor(folder)
+        elif not enabled and self._folder_monitor:
+            self._folder_monitor.stop()
+            self._folder_monitor = None
+            self._batched_paths.clear()
 
-    def _finalize_batch(self):
-        """Idle timeout fired — zip all accumulated files and queue the upload."""
-        self._batch_timer_id = None
-        if not self._batch_files:
+    def _finalize_batch(self, files: list[str]):
+        """Folder stability reached — zip the given files and queue the upload."""
+        if not files:
             return
-        files = list(self._batch_files)
-        self._batch_files.clear()
 
         watch_folder = self._cfg.get("watch_folder", "")
         folder_name = Path(watch_folder).name if watch_folder else "batch"
@@ -2572,11 +2702,15 @@ class App(ctk.CTk):
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
 
-        # Restore watching status
-        name = Path(watch_folder).name if watch_folder else "?"
-        self._watch_status_label.configure(
-            text=f"●  Watching  •  {name}", text_color=GREEN)
         self._log(f"Batch zip started: {len(files)} file(s) → {zip_name}")
+
+        # Mark these files as batched and restart the monitor for the next burst
+        self._batched_paths.update(files)
+        if watch_folder and Path(watch_folder).is_dir():
+            name = Path(watch_folder).name
+            self._watch_status_label.configure(
+                text=f"●  Watching  •  {name}", text_color=GREEN)
+            self._start_folder_monitor(watch_folder)
 
     def _log(self, message: str):
         """Append a timestamped line to the activity log file."""
@@ -2654,11 +2788,6 @@ class App(ctk.CTk):
                                   account_name=account_name)
         self.wait_window(dlg)
 
-    def _edit_global_template(self):
-        """Open template dialog scoped to global default (no account)."""
-        dlg = EmailTemplateDialog(self, self._cfg, account_id="", account_name="")
-        self.wait_window(dlg)
-
     def _update_sender_label(self):
         account_id = self._cfg.get("active_drive_account_id", "")
         prof = sender_profile.load(account_id)
@@ -2669,8 +2798,15 @@ class App(ctk.CTk):
         else:
             self._sender_label.configure(text="— not set up —", text_color=TEXT2)
 
-    def _post_upload_email(self, entry: UploadEntry, drive_file_id: str, force_send: bool = False):
-        """Background thread: make file shareable, send email if configured."""
+    def _post_upload_email(self, entry: UploadEntry, drive_file_id: str,
+                           force_send: bool = False,
+                           precomposed_subject: str | None = None,
+                           precomposed_body: str | None = None):
+        """Background thread: make file shareable, send email if configured.
+
+        precomposed_subject/body: user-edited content from ComposeEmailDialog.
+        Any remaining `{link}` placeholder is substituted with the real Drive URL.
+        """
         try:
             account_id = self._cfg.get("active_drive_account_id", "")
             if account_id and drive_accounts.token_path(account_id).exists():
@@ -2704,25 +2840,28 @@ class App(ctk.CTk):
                     "Click Setup in the Email Notification panel."))
                 return
 
-            # Per-account template overrides global template
-            acct_tmpl = self._cfg.get("account_templates", {}).get(account_id, {})
-
-            from datetime import date as _date
-            subs = {
-                "filename": entry.file_name,
-                "link": link,
-                "date": _date.today().strftime("%B %d, %Y"),
-                "sender_name": prof.get("sender_name", ""),
-            }
-            subject = acct_tmpl.get(
-                "email_subject",
-                self._cfg.get("email_subject", "Your file is ready: {filename}")
-            ).format_map(subs)
-            body = acct_tmpl.get(
-                "email_body",
-                self._cfg.get("email_body",
-                              "Hi,\n\nYour file is ready:\n{link}\n\nBest,\n{sender_name}")
-            ).format_map(subs)
+            if precomposed_subject is not None:
+                # Manual compose path — substitute {link} in user-edited content
+                subject = precomposed_subject.replace("{link}", link)
+                body    = (precomposed_body or "").replace("{link}", link)
+            else:
+                # Auto-send path — build from account template
+                acct_tmpl = self._cfg.get("account_templates", {}).get(account_id, {})
+                from datetime import date as _date
+                subs = {
+                    "filename": entry.file_name,
+                    "link": link,
+                    "date": _date.today().strftime("%B %d, %Y"),
+                    "sender_name": prof.get("sender_name", ""),
+                }
+                subject = acct_tmpl.get(
+                    "email_subject",
+                    self._cfg.get("email_subject", EmailTemplateDialog.DEFAULT_SUBJECT)
+                ).format_map(subs)
+                body = acct_tmpl.get(
+                    "email_body",
+                    self._cfg.get("email_body", EmailTemplateDialog.DEFAULT_BODY)
+                ).format_map(subs)
 
             cc  = self._cfg.get("recipient_cc", "")
             bcc = self._cfg.get("recipient_bcc", "")

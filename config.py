@@ -20,7 +20,7 @@ DEFAULTS = {
     "watch_enabled": False,
     "watch_folder": "",
     "watch_batch_mode": False,
-    "watch_batch_idle_secs": 60,
+    "watch_batch_stable_secs": 15,   # seconds folder must be fully static before zipping
     # Email Notification
     "email_enabled": False,
     "recipient_email": "",       # comma-separated To addresses
