@@ -661,7 +661,13 @@ class ZipWorker:
         tmp_dir = None
         try:
             folder_name = Path(self._folder).name
-            tmp_dir = tempfile.mkdtemp(prefix="uplift-")
+            # Create temp dir on the same volume as the source so we don't
+            # exhaust boot-drive space when the source is on an external drive.
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="uplift-",
+                                           dir=Path(self._folder).parent)
+            except OSError:
+                tmp_dir = tempfile.mkdtemp(prefix="uplift-")
             zip_path = os.path.join(tmp_dir, folder_name + ".zip")
 
             # Collect all files first so we know the total count
@@ -737,7 +743,13 @@ class ListZipWorker:
     def run(self):
         tmp_dir = None
         try:
-            tmp_dir = tempfile.mkdtemp(prefix="uplift-")
+            # Create temp dir on the same volume as the source files so we
+            # don't exhaust boot-drive space for large exports on external drives.
+            source_parent = Path(self._files[0]).parent if self._files else None
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="uplift-", dir=source_parent)
+            except (OSError, TypeError):
+                tmp_dir = tempfile.mkdtemp(prefix="uplift-")
             zip_path = os.path.join(tmp_dir, self._zip_name)
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                 for i, fp in enumerate(self._files):
