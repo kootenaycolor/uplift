@@ -148,10 +148,17 @@ if [ -d "$SCRIPT_DIR/fonts" ]; then
   cp -r "$SCRIPT_DIR/fonts" "$DIST/Contents/Resources/fonts"
 fi
 
-# Copy credentials + token if present
-for f in credentials.json token.json; do
-  [ -f "$SCRIPT_DIR/$f" ] && cp "$SCRIPT_DIR/$f" "$DIST/Contents/Resources/"
-done
+# Copy SVG icons
+if [ -d "$SCRIPT_DIR/design/new-icons" ]; then
+  cp -r "$SCRIPT_DIR/design/new-icons" "$DIST/Contents/Resources/icons"
+fi
+
+# Copy OAuth client credentials (needed for auth flow; not a user token)
+if [ -f "$SCRIPT_DIR/credentials.json" ]; then
+  cp "$SCRIPT_DIR/credentials.json" "$DIST/Contents/Resources/credentials.json"
+  chmod 600 "$DIST/Contents/Resources/credentials.json"
+fi
+# token.json is NOT bundled — tokens are stored in Keychain
 
 # Ad-hoc sign AFTER all files are in place so the signature covers everything
 codesign --deep --force -s - "$DIST" 2>/dev/null && echo "  (ad-hoc signed)" || echo "  (signing skipped)"

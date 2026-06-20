@@ -35,6 +35,9 @@ from googleapiclient.http import MediaIoBaseUpload
 # This adapter makes ALL Drive API calls use the same requests/urllib3/ssl
 # stack, eliminating the crash vector entirely.
 
+_HTTP_TIMEOUT = 30  # seconds for all Drive API calls (parity with drive_accounts.py)
+
+
 class _FakeResponse(dict):
     """httplib2-compatible response wrapper around requests.Response.
 
@@ -71,6 +74,7 @@ class _RequestsHttp:
             data=body,
             headers=headers or {},
             allow_redirects=(redirections > 0),
+            timeout=_HTTP_TIMEOUT,
         )
         return _FakeResponse(resp), resp.content
 
@@ -87,18 +91,13 @@ CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB — must be a multiple of 256 KB
 
 _HERE = Path(__file__).parent
 CREDENTIALS_PATH = _HERE / "credentials.json"
-TOKEN_PATH = _HERE / "token.json"
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
-def get_service(token_path_override=None, credentials_path_override=None):
-    """Return an authenticated Drive service. Runs OAuth flow on first use.
-
-    Pass token_path_override / credentials_path_override to use a non-default
-    account (e.g. from drive_accounts). Omit both to use the app's own token.json.
-    """
-    _tp = Path(token_path_override) if token_path_override else TOKEN_PATH
+def get_service(token_path_override: str, credentials_path_override=None):
+    """Return an authenticated Drive service. Runs OAuth flow on first use."""
+    _tp = Path(token_path_override)
     _cp = Path(credentials_path_override) if credentials_path_override else CREDENTIALS_PATH
 
     creds = None
@@ -117,19 +116,20 @@ def get_service(token_path_override=None, credentials_path_override=None):
             flow = InstalledAppFlow.from_client_secrets_file(str(_cp), SCOPES)
             creds = flow.run_local_server(port=0)
 
+        _tp.parent.mkdir(parents=True, exist_ok=True)
         _tp.write_text(creds.to_json())
 
     return _build_service(creds)
 
 
-def build_thread_service(token_path_override=None):
+def build_thread_service(token_path_override: str):
     """Return a NEW Drive service with its own requests-based HTTP connection.
 
     Each upload worker thread MUST call this to get an independent service.
     _RequestsHttp wraps AuthorizedSession which is NOT thread-safe to share —
     each call here returns a fresh session with no shared SSL state.
     """
-    _tp = Path(token_path_override) if token_path_override else TOKEN_PATH
+    _tp = Path(token_path_override)
     creds = Credentials.from_authorized_user_file(str(_tp), SCOPES)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
@@ -436,12 +436,10 @@ def restore_upload_request(service, file_path: str, folder_id: str,
     # Restore the session URI — next_chunk() skips initiation when this is set
     request.resumable_uri = resumable_uri
 
-    # Ask Drive how many bytes it actually has (server is authoritative)
+    # Ask Drive how many bytes it actually has (server is authoritative).
+    # If it returns 0, restart from 0 — safer than trusting a possibly-ahead
+    # saved_progress and corrupting the upload.
     confirmed = _query_server_progress(resumable_uri, service._http, file_size)
-    if confirmed == 0 and saved_progress > 0:
-        # Server returned nothing (possibly a 308 with no Range header meaning 0 bytes)
-        # Fall back to saved_progress as a conservative estimate
-        confirmed = 0  # safer to restart from 0 than to corrupt
 
     request.resumable_progress = confirmed
 
@@ -471,12 +469,22 @@ def _query_server_progress(resumable_uri: str, http, file_size: int) -> int:
             return 0
         elif status in (200, 201):  # Already complete
             return file_size
-    except (socket.error, OSError, Exception):
+    except (OSError, ValueError, _requests.RequestException):
         pass
     return 0
 
 
 # ── Drive folder creation ─────────────────────────────────────────────────────
+
+def set_anyone_can_view(service, file_id: str) -> None:
+    """Set 'Anyone with the link can view' on a Drive file."""
+    service.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+
 
 def create_drive_folder(service, name: str, parent_id: str) -> str:
     """Create a folder in Drive under parent_id. Returns the new folder's ID."""

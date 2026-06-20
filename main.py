@@ -61,7 +61,8 @@ TEAL_DEEP  = "#04657e"
 TEAL_MID   = "#3d9eb6"
 TEAL_SOFT  = "#77b2c6"
 TEAL_PALE  = "#cfe1e7"
-TEAL_WASH  = "#eaf2f5"
+TEAL_WASH      = "#eaf2f5"
+TEAL_WASH_DARK = "#1c3238"   # dark-mode equivalent: subtle teal tint on dark surface
 SIDEBAR_BG = "#eae9e9"
 GREEN      = "#197a26"
 RED        = "#cc2222"
@@ -143,6 +144,7 @@ def _th_surface_hover()   -> str: return SURFACE_HOVER_DARK  if _IS_DARK else SU
 def _th_surface_pressed() -> str: return SURFACE_PRESSED_DARK if _IS_DARK else SURFACE_PRESSED
 def _th_ink_disabled()    -> str: return INK_DISABLED_DARK   if _IS_DARK else INK_DISABLED
 def _th_teal_link()       -> str: return TEAL_MID            if _IS_DARK else TEAL_DEEP
+def _th_teal_wash()       -> str: return TEAL_WASH_DARK      if _IS_DARK else TEAL_WASH
 
 
 def _load_theme_overrides() -> None:
@@ -242,6 +244,7 @@ def _build_app_qss() -> str:
     s_pressed = _th_surface_pressed()
     ink_dis   = _th_ink_disabled()
     teal_link = _th_teal_link()
+    teal_wash = _th_teal_wash()
     return f"""
 /* ── Global reset ─────────────────────────────────────────── */
 QWidget {{
@@ -337,18 +340,18 @@ QPushButton#ghost {{
     padding: 5px 12px;
     font-size: 12px;
 }}
-QPushButton#ghost:hover  {{ background: {TEAL_WASH}; color: {ink}; border-color: {TEAL_MID}; }}
+QPushButton#ghost:hover  {{ background: {teal_wash}; color: {ink}; border-color: {TEAL_MID}; }}
 QPushButton#ghost:pressed {{ background: {TEAL_PALE}; color: {ink}; border-color: {TEAL}; }}
 
 QPushButton#icon-btn {{
-    background: {s2};
-    color: {ink};
-    border: 1px solid {TEAL_PALE};
-    border-radius: 2px;
-    padding: 2px;
+    background: transparent;
+    color: {graphite};
+    border: none;
+    border-radius: 11px;
+    padding: 0px;
 }}
-QPushButton#icon-btn:hover  {{ background: {TEAL_WASH}; border-color: {TEAL_MID}; color: {TEAL_DEEP}; }}
-QPushButton#icon-btn:pressed {{ background: {TEAL_PALE}; border-color: {TEAL}; }}
+QPushButton#icon-btn:hover   {{ background: {teal_wash}; color: {TEAL_DEEP}; }}
+QPushButton#icon-btn:pressed {{ background: {TEAL_PALE}; color: {TEAL}; }}
 
 QPushButton#link {{
     background: transparent;
@@ -397,7 +400,7 @@ QSpinBox:focus {{ border: 2px solid {TEAL_MID}; }}
 QSpinBox::up-button, QSpinBox::down-button {{
     width: 16px;
     border: none;
-    background: {TEAL_WASH};
+    background: {teal_wash};
 }}
 QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {TEAL_PALE}; }}
 
@@ -419,7 +422,7 @@ QComboBox QAbstractItemView {{
     color: {ink};
     border: 1px solid {TEAL_PALE};
     border-radius: 4px;
-    selection-background-color: {TEAL_WASH};
+    selection-background-color: {teal_wash};
     selection-color: {ink};
     outline: none;
     padding: 2px;
@@ -430,8 +433,8 @@ QComboBox QAbstractItemView::item {{
     padding: 4px 8px;
     min-height: 24px;
 }}
-QComboBox QAbstractItemView::item:hover    {{ background: {TEAL_WASH}; color: {ink}; }}
-QComboBox QAbstractItemView::item:selected {{ background: {TEAL_WASH}; color: {ink}; }}
+QComboBox QAbstractItemView::item:hover    {{ background: {teal_wash}; color: {ink}; }}
+QComboBox QAbstractItemView::item:selected {{ background: {teal_wash}; color: {ink}; }}
 
 /* ── TreeWidget ───────────────────────────────────────────── */
 QTreeWidget {{
@@ -447,7 +450,7 @@ QTreeWidget::item {{
     padding: 3px 4px;
     min-height: 22px;
 }}
-QTreeWidget::item:hover    {{ background: {TEAL_WASH}; color: {ink}; }}
+QTreeWidget::item:hover    {{ background: {teal_wash}; color: {ink}; }}
 QTreeWidget::item:selected {{ background: {TEAL};      color: white; }}
 QTreeWidget::item:selected:hover {{ background: {TEAL_DEEP}; color: white; }}
 
@@ -465,7 +468,7 @@ QMenu::item {{
     padding: 6px 20px 6px 12px;
     font-size: 13px;
 }}
-QMenu::item:selected  {{ background: {TEAL_WASH}; color: {ink}; }}
+QMenu::item:selected  {{ background: {teal_wash}; color: {ink}; }}
 QMenu::item:disabled  {{ color: {stone}; }}
 QMenu::separator      {{ height: 1px; background: {mist}; margin: 4px 0; }}
 
@@ -479,10 +482,10 @@ QDialog {{ background: {surface}; color: {ink}; }}
 
 /* ── Tooltips ─────────────────────────────────────────────── */
 QToolTip {{
-    background: {ink};
-    color: {surface};
-    border: none;
-    border-radius: 2px;
+    background: {surface};
+    color: {ink};
+    border: 1px solid {mist};
+    border-radius: 4px;
     padding: 4px 8px;
     font-size: 11px;
 }}
@@ -495,6 +498,47 @@ QLabel#section-header {{
     letter-spacing: 2px;
 }}
 """
+
+# ── SVG icon loader ────────────────────────────────────────────────────────────
+def _icons_dir() -> Path:
+    p = Path(__file__).parent / "icons"
+    if p.exists():
+        return p
+    return Path(__file__).parent / "design" / "new-icons"
+
+def _svg_icon(filename: str, color: str, size: int = 16) -> "QIcon":
+    try:
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QByteArray
+        svg = (_icons_dir() / filename).read_text()
+        svg = svg.replace("#000000", color)
+        renderer = QSvgRenderer(QByteArray(svg.encode()))
+        px = QPixmap(size, size)
+        px.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(px)
+    except Exception:
+        return QIcon()
+
+def _svg_pixmap(filename: str, color: str, size: int = 14) -> "QPixmap":
+    try:
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QByteArray
+        svg = (_icons_dir() / filename).read_text()
+        svg = svg.replace("#000000", color)
+        renderer = QSvgRenderer(QByteArray(svg.encode()))
+        px = QPixmap(size, size)
+        px.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+        return px
+    except Exception:
+        return QPixmap()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _fmt_size(n: float) -> str:
@@ -845,12 +889,13 @@ class UploadWorker:
 
     def __init__(self, entry: UploadEntry, state: StateManager,
                  pq: queue.Queue, stop_event: threading.Event,
-                 account_id: str = ""):
+                 account_id: str = "", share_link: bool = False):
         self._entry = entry
         self._state = state
         self._pq = pq
         self._stop = stop_event
         self._account_id = account_id
+        self._share_link = share_link
 
     def _countdown_retry(self, entry_id: str, retry_count: int) -> bool:
         wait = min(2 ** (retry_count - 1), 16)
@@ -873,10 +918,9 @@ class UploadWorker:
         wrapper = None
         try:
             self._pq.put(("status", entry_id, "Connecting…"))
-            if self._account_id and drive_accounts.token_path(self._account_id).exists():
-                service = drive_accounts.build_thread_service(self._account_id)
-            else:
-                service = drivelib.build_thread_service()
+            if not self._account_id:
+                raise RuntimeError("No account selected — go to Accounts and connect a Google Drive account.")
+            service = drive_accounts.build_thread_service(self._account_id)
 
             if self._stop.is_set():
                 self._pq.put(("cancelled", entry_id, None))
@@ -957,6 +1001,14 @@ class UploadWorker:
                         raise
 
             drive_file_id = response.get("id", "") if response else ""
+            if self._share_link and drive_file_id:
+                self._pq.put(("status", entry_id, "Setting public link…"))
+                try:
+                    drivelib.set_anyone_can_view(service, drive_file_id)
+                    self._pq.put(("share_ok", entry_id, drive_file_id))
+                except Exception as _share_err:
+                    import traceback as _tb
+                    self._pq.put(("share_err", entry_id, str(_share_err), _tb.format_exc()))
             self._state.update(entry_id, status="completed",
                                drive_file_id=drive_file_id,
                                completed_at=datetime.now(timezone.utc).isoformat(),
@@ -970,9 +1022,12 @@ class UploadWorker:
                                resumable_progress=self._entry.resumable_progress)
             self._pq.put(("cancelled", entry_id, None))
         except OSError as e:
-            msg = str(e)
-            if "No such file" in msg or "not a file" in msg.lower():
-                msg = "File not accessible — is the external drive still connected?"
+            raw = str(e)
+            if "No such file" in raw or "not a file" in raw.lower():
+                detail = f"{e.strerror} — {e.filename}" if e.filename else e.strerror
+                msg = f"File not accessible: {detail}"
+            else:
+                msg = raw
             saved_uri = (request.resumable_uri if request else None) or self._entry.resumable_uri
             self._state.update(entry_id, status="failed", error=msg,
                                resumable_uri=saved_uri)
@@ -1477,6 +1532,7 @@ class FileRow(QFrame):
         metrics = QFontMetrics(self._name_lbl.font())
         self._name_lbl.setText(
             metrics.elidedText(fname, Qt.TextElideMode.ElideMiddle, 200))
+        self._name_lbl.setToolTip(fname)
         row_lay.addWidget(self._name_lbl)
 
         self._size_lbl = QLabel(_fmt_size(entry.file_size))
@@ -1494,6 +1550,7 @@ class FileRow(QFrame):
         self._stat_lbl.setFont(F_SEMIBOLD(11))
         self._stat_lbl.setStyleSheet(f"color: {_th_stone()};")
         self._stat_lbl.setFixedWidth(44)
+        self._stat_lbl.setFixedHeight(22)
         self._stat_lbl.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         row_lay.addWidget(self._stat_lbl)
@@ -1552,14 +1609,14 @@ class FileRow(QFrame):
             b.clicked.connect(lambda: self._cancel_cb(eid))
             self._ctrl_lay.addWidget(b)
         elif status in ("uploading", "in_progress"):
-            b1 = self._make_icon_btn("⏸", "Pause")
+            b1 = self._make_icon_btn("⏸︎", "Pause")
             b1.clicked.connect(lambda: self._cancel_cb(eid))
             b2 = self._make_icon_btn("✕", "Remove")
             b2.clicked.connect(lambda: self._cancel_cb(eid))
             self._ctrl_lay.addWidget(b1)
             self._ctrl_lay.addWidget(b2)
         elif status == "paused":
-            b1 = self._make_icon_btn("▶", "Resume")
+            b1 = self._make_icon_btn("▶︎", "Resume")
             b1.clicked.connect(lambda: self._resume_cb(eid))
             b2 = self._make_icon_btn("✕", "Remove")
             b2.clicked.connect(lambda: self._cancel_cb(eid))
@@ -1573,14 +1630,19 @@ class FileRow(QFrame):
             self._ctrl_lay.addWidget(b1)
             self._ctrl_lay.addWidget(b2)
         elif status == "done":
-            check = QLabel("✓")
-            check.setFont(F_SEMIBOLD(12))
-            check.setStyleSheet(f"color: {TEAL};")
-            check.setFixedSize(22, 22)
-            check.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._ctrl_lay.addWidget(check)
             if self._link_url:
-                b = self._make_icon_btn("⎘", "Copy link")
+                b = QPushButton("Copy Link")
+                b.setFont(F_BODY(11))
+                b.setFixedHeight(22)
+                b.setToolTip("Copy Google Drive link")
+                b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                b.setStyleSheet(
+                    f"QPushButton {{ background: transparent; color: {_th_ink()};"
+                    f" border: 1px solid {TEAL_PALE}; border-radius: 4px;"
+                    f" padding: 0px 8px; font-size: 11px; }}"
+                    f"QPushButton:hover {{ background: {_th_teal_wash()};"
+                    f" border-color: {TEAL_MID}; }}"
+                )
                 b.clicked.connect(self._copy_link)
                 self._ctrl_lay.addWidget(b)
         elif status in ("pausing", "compressing"):
@@ -1639,7 +1701,7 @@ class FileRow(QFrame):
         self._stats_lbl.setText("Uploading…")
         self._stats_lbl.setStyleSheet(f"color: {_th_stone()};")
         self.setStyleSheet(
-            f"QFrame {{ background: {TEAL_WASH}; border-bottom: 1px solid {_th_mist()}; }}")
+            f"QFrame {{ background: {_th_teal_wash()}; border-bottom: 1px solid {_th_mist()}; }}")
 
     def set_pausing(self):
         self._rebuild_ctrl("pausing")
@@ -1676,8 +1738,11 @@ class FileRow(QFrame):
         self._bar.set_pct(1.0)
         self._stats_lbl.setText(f"{_fmt_size(self._file_size)} uploaded successfully")
         self._stats_lbl.setStyleSheet(f"color: {_th_green()};")
+        self._stat_lbl.setFixedWidth(58)
         self._stat_lbl.setText("done")
-        self._stat_lbl.setStyleSheet(f"color: {TEAL};")
+        self._stat_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._stat_lbl.setStyleSheet(
+            f"color: {TEAL}; border: 1px solid {TEAL_PALE}; border-radius: 4px; padding: 2px 6px;")
         self.setStyleSheet(
             f"QFrame {{ background: {_th_surface()}; border-bottom: 1px solid {_th_mist()}; }}")
 
@@ -1717,7 +1782,7 @@ class FileRow(QFrame):
 
     def refresh_theme(self):
         st = getattr(self, "_status", "queued")
-        bg = TEAL_WASH if st == "uploading" else _th_surface()
+        bg = _th_teal_wash() if st == "uploading" else _th_surface()
         self.setStyleSheet(
             f"QFrame {{ background: {bg}; border-bottom: 1px solid {_th_mist()}; }}")
         self._name_lbl.setStyleSheet(f"color: {_th_ink()};")
@@ -1829,7 +1894,7 @@ class FolderPickerDialog(QDialog):
     def _col_style(self, focused: bool = True) -> str:
         w = f"QListWidget {{ background: {_th_surface2()}; border: none; border-right: 1px solid {_th_mist()}; outline: 0; }}"
         i = f"QListWidget::item {{ padding: 5px 10px; color: {_th_ink()}; }}"
-        h = f"QListWidget::item:hover {{ background: {TEAL_WASH}; }}"
+        h = f"QListWidget::item:hover {{ background: {_th_teal_wash()}; }}"
         # Dim selection in unfocused columns so active column is obvious
         sel_bg = TEAL if focused else TEAL_PALE
         sel_fg = "white" if focused else _th_ink()
@@ -2921,6 +2986,60 @@ class _DropZone(QFrame):
         event.acceptProposedAction()
 
 
+# ── FolderHeaderRow ────────────────────────────────────────────────────────────
+
+class FolderHeaderRow(QWidget):
+    """Separator row shown above a group of files that share a Drive subfolder."""
+    def __init__(self, parent, folder_rel_name: str, drive_folder_id: str):
+        super().__init__(parent)
+        self._drive_folder_id = drive_folder_id
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 3, 10, 3)
+        lay.setSpacing(6)
+
+        icon = QLabel("›")
+        icon.setFont(F_BODY(10))
+        icon.setStyleSheet(f"color: {_th_stone()};")
+        lay.addWidget(icon, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._name_lbl = QLabel(folder_rel_name)
+        self._name_lbl.setFont(F_SEMIBOLD(11))
+        self._name_lbl.setStyleSheet(f"color: {_th_graphite()};")
+        self._name_lbl.setToolTip(folder_rel_name)
+        lay.addWidget(self._name_lbl, 1)
+
+        self._link_btn = QPushButton("Copy Folder Link")
+        self._link_btn.setToolTip(f"Copy Drive folder link: {folder_rel_name}")
+        self._link_btn.setFont(F_BODY(11))
+        self._link_btn.setFixedHeight(22)
+        self._link_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._link_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {_th_ink()};"
+            f" border: 1px solid {TEAL_PALE}; border-radius: 4px;"
+            f" padding: 0px 8px; font-size: 11px; }}"
+            f"QPushButton:hover {{ background: {_th_teal_wash()};"
+            f" border-color: {TEAL_MID}; }}"
+        )
+        if drive_folder_id:
+            url = f"https://drive.google.com/drive/folders/{drive_folder_id}"
+            self._link_btn.clicked.connect(
+                lambda _checked=False, u=url: QApplication.clipboard().setText(u))
+        else:
+            self._link_btn.setEnabled(False)
+        lay.addWidget(self._link_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._apply_style()
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            f"FolderHeaderRow {{ background: {_th_surface2()};"
+            f" border-bottom: 1px solid {_th_mist()}; }}")
+
+    def refresh_theme(self):
+        self._apply_style()
+        self._name_lbl.setStyleSheet(f"color: {_th_graphite()};")
+
+
 # ── JobTile ────────────────────────────────────────────────────────────────────
 
 class JobTile(QFrame):
@@ -2929,6 +3048,7 @@ class JobTile(QFrame):
         self._job    = job
         self._app    = app
         self._rows: dict[str, FileRow] = {}
+        self._folder_headers: dict[str, FolderHeaderRow] = {}
         self._expanded = True
 
         source       = self._job.get("source", "manual")
@@ -2968,7 +3088,7 @@ class JobTile(QFrame):
         self._inner_lay.addWidget(self._strip)
 
         self._watch_status_row: QWidget | None = None
-        if source == "watch":
+        if source in ("watch", "manual"):
             self._watch_status_row = self._build_watch_status_row()
             self._inner_lay.addWidget(self._watch_status_row)
 
@@ -2995,7 +3115,7 @@ class JobTile(QFrame):
         lay.addWidget(self._tri, 0, Qt.AlignmentFlag.AlignVCenter)
 
         source     = self._job.get("source", "manual")
-        badge_bg   = TEAL_WASH if source == "watch" else SURFACE2
+        badge_bg   = _th_teal_wash() if source == "watch" else _th_surface2()
         badge_fg   = TEAL_DEEP if source == "watch" else STONE
         badge_text = "WATCH" if source == "watch" else "UPLOAD"
         self._badge = QLabel(badge_text)
@@ -3088,47 +3208,79 @@ class JobTile(QFrame):
         lay.setSpacing(8)
 
         folder_name = self._job.get("drive_folder_name", "")
+        full_folder  = folder_name
         if len(folder_name) > 40:
             folder_name = "…" + folder_name[-38:]
-        self._folder_lbl = QLabel(f"📁  {folder_name}" if folder_name else "📁  —")
+        self._folder_lbl = QLabel(f"›  {folder_name}" if folder_name else "›  —")
         self._folder_lbl.setFont(F_MONO(10))
         self._folder_lbl.setStyleSheet(f"color: {_th_stone()};")
+        if full_folder:
+            self._folder_lbl.setToolTip(full_folder)
         lay.addWidget(self._folder_lbl, 1)
 
         if self._job.get("zip"):
-            self._zip_lbl = QLabel("🗜")
-            self._zip_lbl.setFont(F_BODY(12))
-            self._zip_lbl.setStyleSheet(f"color: {_th_stone()};")
-            self._zip_lbl.setToolTip("Zip")
+            self._zip_lbl = QLabel("Zip")
+            self._zip_lbl.setFont(F_BODY(11))
+            self._zip_lbl.setStyleSheet(
+                f"color: {TEAL_DEEP}; background: transparent;"
+                f" border: 1px solid {TEAL_PALE}; border-radius: 4px; padding: 2px 6px;")
+            self._zip_lbl.setToolTip("Compressed as zip")
             lay.addWidget(self._zip_lbl)
         else:
             self._zip_lbl = None
 
+        # For watch jobs, show the destination folder link immediately.
+        # For manual jobs, set_folder_drive_id() reveals this after folder creation.
+        source = self._job.get("source", "manual")
+        dest_id = self._job.get("drive_folder_id", "")
+        self._folder_link_url = (
+            f"https://drive.google.com/drive/folders/{dest_id}" if dest_id else "")
+        self._folder_link_btn = QPushButton("Copy Folder Link")
+        self._folder_link_btn.setFont(F_BODY(11))
+        self._folder_link_btn.setFixedHeight(22)
+        self._folder_link_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._folder_link_btn.setToolTip("Copy Drive destination folder link")
+        self._folder_link_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {_th_ink()};"
+            f" border: 1px solid {TEAL_PALE}; border-radius: 4px;"
+            f" padding: 0px 8px; font-size: 11px; }}"
+            f"QPushButton:hover {{ background: {_th_teal_wash()};"
+            f" border-color: {TEAL_MID}; }}"
+        )
+        self._folder_link_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(self._folder_link_url))
+        if source == "watch" and dest_id:
+            self._folder_link_btn.show()
+        else:
+            self._folder_link_btn.hide()
+        lay.addWidget(self._folder_link_btn)
+
         email_cfg = self._job.get("email_cfg")
         jid = self._job["id"]
-        self._email_lbl = QPushButton("✉")
-        self._email_lbl.setFixedSize(22, 22)
-        self._email_lbl.setFont(F_BODY(12))
+        self._email_lbl = QPushButton("Edit Email")
+        self._email_lbl.setFont(F_BODY(11))
+        self._email_lbl.setObjectName("ghost")
+        self._email_lbl.setFixedHeight(22)
         self._email_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._email_lbl.clicked.connect(lambda: self._app._edit_job_email(jid))
+        has_email = bool(email_cfg and email_cfg.get("to", "").strip())
+        self._email_lbl.setVisible(has_email)
         lay.addWidget(self._email_lbl)
         self._refresh_email_btn_style(email_cfg)
 
         return strip
 
+    def set_folder_drive_id(self, drive_id: str, folder_name: str):
+        self._folder_link_url = f"https://drive.google.com/drive/folders/{drive_id}"
+        self._folder_link_btn.setToolTip(f"Copy link: {folder_name}")
+        self._folder_link_btn.show()
+
     def _refresh_email_btn_style(self, email_cfg: dict | None):
+        btn = self._email_lbl
         if email_cfg and email_cfg.get("to", "").strip():
-            self._email_lbl.setStyleSheet(
-                f"QPushButton {{ color: {TEAL}; background: transparent; "
-                f"border: none; padding: 0; }}"
-                f"QPushButton:hover {{ color: {TEAL_DEEP}; }}")
-            self._email_lbl.setToolTip(f"Edit email → {email_cfg.get('to', '')}")
+            btn.setToolTip(f"Edit email → {email_cfg.get('to', '')}")
         else:
-            self._email_lbl.setStyleSheet(
-                f"QPushButton {{ color: {_th_stone()}; background: transparent; "
-                f"border: none; padding: 0; }}"
-                f"QPushButton:hover {{ color: {_th_graphite()}; }}")
-            self._email_lbl.setToolTip("Add email notification…")
+            btn.setToolTip("Add email notification…")
 
     def _build_watch_status_row(self) -> QWidget:
         row = QWidget()
@@ -3262,7 +3414,7 @@ class JobTile(QFrame):
             self._tri.setStyleSheet(f"color: {_th_stone()};")
             self._count_lbl.setStyleSheet(f"color: {_th_stone()};")
             if source == "watch":
-                bbg, bfg = TEAL_WASH, TEAL_DEEP
+                bbg, bfg = _th_teal_wash(), TEAL_DEEP
             else:
                 bbg, bfg = _th_surface2(), _th_stone()
         self._badge.setStyleSheet(
@@ -3275,11 +3427,19 @@ class JobTile(QFrame):
         self._folder_lbl.setStyleSheet(f"color: {_th_stone()};")
         if self._watch_status_row is not None:
             self._watch_status_row.setStyleSheet(f"background: {_th_surface2()};")
+        for hdr in self._folder_headers.values():
+            hdr.refresh_theme()
         for row in self._rows.values():
             row.refresh_theme()
 
 
     def add_file(self, entry):
+        group_id = getattr(entry, "group_id", None)
+        if group_id and group_id not in self._folder_headers:
+            group_name = getattr(entry, "group_name", None) or group_id
+            hdr = FolderHeaderRow(self._files_widget, group_name, entry.folder_id)
+            self._folder_headers[group_id] = hdr
+            self._files_lay.addWidget(hdr)
         row = FileRow(self._files_widget, entry,
                       cancel_cb=self._app._cancel_upload,
                       resume_cb=self._app._resume_upload,
@@ -3310,9 +3470,10 @@ class JobTile(QFrame):
             return
         color_map = {"sent": GREEN, "failed": RED, "sending": TEAL_MID}
         c = color_map.get(status, TEAL)
+        label_map = {"sent": "Email Sent", "failed": "Email Failed", "sending": "Sending…"}
+        self._email_lbl.setText(label_map.get(status, "Edit Email"))
         self._email_lbl.setStyleSheet(
-            f"QPushButton {{ color: {c}; background: transparent; border: none; padding: 0; }}"
-            f"QPushButton:hover {{ color: {c}; }}")
+            f"QPushButton {{ color: {c}; border-color: {c}; }}")
         self._email_lbl.setToolTip(f"Email {status}")
 
 
@@ -3323,7 +3484,7 @@ class QueuePanel(QWidget):
         super().__init__(parent)
         self._app   = app
         self._tiles: dict[str, JobTile] = {}
-        self.setStyleSheet(f"background: {_th_bg_glass()};")
+        self.setStyleSheet(f"background: {_th_surface_glass()};")
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -3333,7 +3494,7 @@ class QueuePanel(QWidget):
         toolbar = self._toolbar
         toolbar.setFixedHeight(40)
         toolbar.setStyleSheet(
-            f"QFrame {{ background: {_th_bg_glass()}; border-bottom: 1px solid {_th_mist()}; }}")
+            f"QFrame {{ background: {_th_surface_glass()}; border-bottom: 1px solid {_th_mist()}; }}")
         t_lay = QHBoxLayout(toolbar)
         t_lay.setContentsMargins(SP_QUEUE_H, 0, 16, 0)
         t_lay.setSpacing(10)
@@ -3362,7 +3523,7 @@ class QueuePanel(QWidget):
         scroll.viewport().setStyleSheet("background: transparent;")
 
         self._content = QWidget()
-        self._content.setStyleSheet(f"background: {_th_bg_glass()};")
+        self._content.setStyleSheet(f"background: {_th_surface_glass()};")
         self._content_lay = QVBoxLayout(self._content)
         self._content_lay.setContentsMargins(SP_QUEUE_H, 12, SP_QUEUE_H, SP_QUEUE_H)
         self._content_lay.setSpacing(SP_TILE_GAP)
@@ -3386,10 +3547,10 @@ class QueuePanel(QWidget):
             self._scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
             self._scroll.viewport().setStyleSheet("background: transparent;")
         else:
-            self.setStyleSheet(f"background: {_th_bg_glass()};")
+            self.setStyleSheet(f"background: {_th_surface_glass()};")
             self._toolbar.setStyleSheet(
-                f"QFrame {{ background: {_th_bg_glass()}; border-bottom: 1px solid {_th_mist()}; }}")
-            self._content.setStyleSheet(f"background: {_th_bg_glass()};")
+                f"QFrame {{ background: {_th_surface_glass()}; border-bottom: 1px solid {_th_mist()}; }}")
+            self._content.setStyleSheet(f"background: {_th_surface_glass()};")
         self._queue_lbl.setStyleSheet(f"color: {_th_ink()};")
         self._empty_lbl.setStyleSheet(f"color: {_th_stone()};")
 
@@ -3527,7 +3688,7 @@ class JobCreationPanel(QFrame):
                     f"QPushButton:hover {{ background: {TEAL_DEEP}; color: white; }}")
         return (f"QPushButton {{ background: {_th_surface2()}; color: {_th_ink()}; "
                 f"border: 1px solid {TEAL_PALE}; border-radius: 4px; padding: 4px 14px; }}"
-                f"QPushButton:hover {{ background: {TEAL_WASH}; border-color: {TEAL_MID}; color: {_th_ink()}; }}")
+                f"QPushButton:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; color: {_th_ink()}; }}")
 
     def _switch_mode(self, mode: str):
         self._mode = mode
@@ -3549,17 +3710,17 @@ class JobCreationPanel(QFrame):
         return (
             f"QPushButton {{ background: {_th_surface2()}; color: {_th_ink()}; "
             f"border: 1px solid {TEAL_PALE}; border-radius: 4px; text-align: left; padding: 0 8px; }}"
-            f"QPushButton:hover {{ background: {TEAL_WASH}; border-color: {TEAL_MID}; color: {_th_ink()}; }}"
+            f"QPushButton:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; color: {_th_ink()}; }}"
         )
 
     def _acct_combo_style(self) -> str:
         return (
             f"QComboBox {{ background: {_th_surface2()}; color: {_th_ink()}; "
             f"border: 1px solid {TEAL_PALE}; border-radius: 4px; padding: 0 8px; }}"
-            f"QComboBox:hover {{ background: {TEAL_WASH}; border-color: {TEAL_MID}; }}"
+            f"QComboBox:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; }}"
             f"QComboBox::drop-down {{ border: none; width: 20px; }}"
             f"QComboBox QAbstractItemView {{ background: {_th_surface2()}; color: {_th_ink()}; "
-            f"border: 1px solid {TEAL_PALE}; selection-background-color: {TEAL_WASH}; }}"
+            f"border: 1px solid {TEAL_PALE}; selection-background-color: {_th_teal_wash()}; }}"
         )
 
     def refresh_theme(self):
@@ -3630,6 +3791,23 @@ class JobCreationPanel(QFrame):
         br_lay.addWidget(self._file_count_lbl)
         br_lay.addStretch()
         ll.addWidget(browse_row)
+
+        # Scrollable selection list
+        self._sel_list_widget = QWidget()
+        self._sel_list_widget.setStyleSheet("background: transparent;")
+        self._sel_list_lay = QVBoxLayout(self._sel_list_widget)
+        self._sel_list_lay.setContentsMargins(0, 2, 0, 0)
+        self._sel_list_lay.setSpacing(2)
+
+        self._sel_scroll = QScrollArea()
+        self._sel_scroll.setWidgetResizable(True)
+        self._sel_scroll.setMaximumHeight(96)
+        self._sel_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._sel_scroll.setStyleSheet("background: transparent; border: none;")
+        self._sel_scroll.setWidget(self._sel_list_widget)
+        self._sel_scroll.hide()
+        ll.addWidget(self._sel_scroll)
+
         ll.addStretch()
         lay.addWidget(left, 2)
 
@@ -3882,6 +4060,7 @@ class JobCreationPanel(QFrame):
         combo.setFixedHeight(26)
         combo.setStyleSheet(self._acct_combo_style())
         self._populate_accounts(combo)
+        combo.currentIndexChanged.connect(lambda _: self._on_acct_changed(combo))
         lay.addWidget(combo, 1)
         if which == "u":
             self._acct_combo_u = combo
@@ -3907,16 +4086,27 @@ class JobCreationPanel(QFrame):
         email_lbl.setFont(F_BODY(11))
         lay.addWidget(email_toggle)
         lay.addWidget(email_lbl)
+
+        share_toggle = KToggle(on=False)
+        share_lbl = QLabel("Public Link")
+        share_lbl.setFont(F_BODY(11))
+        _share_tip = 'After upload, sets sharing to "Anyone with the link" → Viewer'
+        share_lbl.setToolTip(_share_tip)
+        share_toggle.setToolTip(_share_tip)
+        lay.addWidget(share_toggle)
+        lay.addWidget(share_lbl)
         lay.addStretch()
 
         if which == "u":
             self._zip_toggle_u   = zip_toggle
             self._email_toggle_u = email_toggle
+            self._share_toggle_u = share_toggle
             zip_toggle.toggled.connect(self._on_zip_toggle_u)
             email_toggle.toggled.connect(self._on_email_toggle_u)
         else:
             self._zip_toggle_w   = zip_toggle
             self._email_toggle_w = email_toggle
+            self._share_toggle_w = share_toggle
             zip_toggle.toggled.connect(self._on_zip_toggle_w)
             email_toggle.toggled.connect(self._on_email_toggle_w)
         return row
@@ -4050,19 +4240,60 @@ class JobCreationPanel(QFrame):
         self._update_selection_label()
 
     def _update_selection_label(self):
+        n_f = len(self._pending_files)
+        n_d = len(self._pending_folders)
         parts = []
-        if self._pending_folders:
-            n = len(self._pending_folders)
-            parts.append(f"{n} folder{'s' if n != 1 else ''}")
-        if self._pending_files:
-            n = len(self._pending_files)
-            parts.append(f"{n} file{'s' if n != 1 else ''}")
+        if n_d:
+            parts.append(f"{n_d} folder{'s' if n_d != 1 else ''}")
+        if n_f:
+            parts.append(f"{n_f} file{'s' if n_f != 1 else ''}")
         if parts:
             self._file_count_lbl.setText(" + ".join(parts) + " selected")
             self._file_count_lbl.setStyleSheet(f"color: {_th_ink()};")
         else:
             self._file_count_lbl.setText("No files selected")
             self._file_count_lbl.setStyleSheet(f"color: {_th_graphite()};")
+
+        # Repopulate scrollable list
+        while self._sel_list_lay.count():
+            item = self._sel_list_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        entries = [(p, True) for p in self._pending_folders] + [(p, False) for p in self._pending_files]
+        for path, is_folder in entries:
+            name = Path(path).name
+            row = QWidget()
+            row.setStyleSheet("background: transparent;")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(4)
+            prefix = "›" if is_folder else "·"
+            lbl = QLabel(f"{prefix}  {name}")
+            lbl.setFont(F_MONO(10))
+            lbl.setStyleSheet(f"color: {_th_graphite()}; background: transparent;")
+            lbl.setToolTip(path)
+            rl.addWidget(lbl, 1)
+            rm = QPushButton("✕")
+            rm.setFixedSize(16, 16)
+            rm.setFont(F_BODY(9))
+            rm.setStyleSheet(
+                f"QPushButton {{ background: transparent; border: none; color: {_th_stone()}; }}"
+                f"QPushButton:hover {{ color: {RED}; }}")
+            rm.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            rm.clicked.connect(lambda _checked, p=path, d=is_folder: self._remove_pending(p, d))
+            rl.addWidget(rm)
+            self._sel_list_lay.addWidget(row)
+
+        self._sel_scroll.setVisible(bool(entries))
+
+    def _remove_pending(self, path: str, is_folder: bool):
+        if is_folder:
+            self._pending_folders = [p for p in self._pending_folders if p != path]
+        else:
+            self._pending_files = [p for p in self._pending_files if p != path]
+        self._update_selection_label()
+
 
     def _browse_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -4107,6 +4338,12 @@ class JobCreationPanel(QFrame):
             display = folder if len(folder) < 44 else "…" + folder[-42:]
             self._watch_path_lbl.setText(display)
             self._watch_path_lbl.setStyleSheet(f"color: {_th_ink()};")
+
+    def _on_acct_changed(self, combo: QComboBox):
+        self._available_folders = []
+        acct_id = self._get_acct_id(combo)
+        if acct_id:
+            self.preload_folders(acct_id)
 
     def preload_folders(self, acct_id: str):
         """Called by App after accounts ready. Loads folders silently in background."""
@@ -4176,7 +4413,7 @@ class JobCreationPanel(QFrame):
                 disp = "…" + disp[-36:]
             dest_btn.setText(f"📁  {disp}")
             dest_btn.setStyleSheet(
-                f"QPushButton {{ background: {TEAL_WASH}; color: {_th_ink()}; "
+                f"QPushButton {{ background: {_th_teal_wash()}; color: {_th_ink()}; "
                 f"border: 1px solid {TEAL_MID}; border-radius: 4px; text-align: left; padding: 0 8px; }}"
                 f"QPushButton:hover {{ background: {TEAL_PALE}; border-color: {TEAL}; color: {_th_ink()}; }}"
             )
@@ -4196,10 +4433,11 @@ class JobCreationPanel(QFrame):
         if not self._folder_id:
             QMessageBox.warning(self, "No Destination", "Pick a Drive folder first.")
             return
-        acct_id   = self._get_acct_id(self._acct_combo_u)
-        zip_on    = self._zip_toggle_u._on
-        email_cfg = self._build_email_cfg(self._email_toggle_u, "u")
-        keep_zip  = self._keep_zip_toggle_u._on if zip_on else False
+        acct_id    = self._get_acct_id(self._acct_combo_u)
+        zip_on     = self._zip_toggle_u._on
+        email_cfg  = self._build_email_cfg(self._email_toggle_u, "u")
+        keep_zip   = self._keep_zip_toggle_u._on if zip_on else False
+        share_link = self._share_toggle_u._on
         custom_zip_name = self._zip_name_edit_u.text().strip() if zip_on else ""
         base = {
             "source":           "manual",
@@ -4209,6 +4447,7 @@ class JobCreationPanel(QFrame):
             "email_cfg":        email_cfg,
             "zip":              zip_on,
             "keep_zip":         keep_zip,
+            "share_link":       share_link,
         }
         ts = datetime.now().strftime("%H:%M")
         # One job per folder — preserves structure
@@ -4239,9 +4478,10 @@ class JobCreationPanel(QFrame):
         if not self._folder_id:
             QMessageBox.warning(self, "No Destination", "Pick a Drive folder first.")
             return
-        acct_id  = self._get_acct_id(self._acct_combo_w)
-        zip_on   = self._zip_toggle_w._on
-        email_cfg = self._build_email_cfg(self._email_toggle_w, "w")
+        acct_id    = self._get_acct_id(self._acct_combo_w)
+        zip_on     = self._zip_toggle_w._on
+        email_cfg  = self._build_email_cfg(self._email_toggle_w, "w")
+        share_link = self._share_toggle_w._on
         raw_exts = self._watch_exts_edit.text().strip()
         exts = [e.strip() if e.strip().startswith(".") else f".{e.strip()}"
                 for e in raw_exts.split() if e.strip()]
@@ -4262,6 +4502,7 @@ class JobCreationPanel(QFrame):
             "watch_recursive":    self._watch_recursive_toggle._on,
             "watch_ignore_hidden": self._watch_ignore_hidden_toggle._on,
             "watch_subfolder_zip": zip_on and self._subfolder_zip_toggle_w._on,
+            "share_link":          share_link,
         }
         self.job_requested.emit(spec)
         self._watch_path = ""
@@ -4323,7 +4564,7 @@ class WatchEditDialog(QDialog):
         self._local_lbl.setStyleSheet(
             f"QPushButton {{ background: {_th_surface2()}; color: {_th_ink()}; border: 1px solid {TEAL_PALE};"
             f" border-radius: 4px; text-align: left; padding: 0 8px; }}"
-            f"QPushButton:hover {{ background: {TEAL_WASH}; border-color: {TEAL_MID}; }}")
+            f"QPushButton:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; }}")
         self._local_lbl.clicked.connect(self._pick_local)
         lay.addWidget(lbl_row("Watch folder:", self._local_lbl))
 
@@ -4334,7 +4575,7 @@ class WatchEditDialog(QDialog):
         self._drive_btn.setStyleSheet(
             f"QPushButton {{ background: {_th_surface2()}; color: {_th_ink()}; border: 1px solid {TEAL_PALE};"
             f" border-radius: 4px; text-align: left; padding: 0 8px; }}"
-            f"QPushButton:hover {{ background: {TEAL_WASH}; border-color: {TEAL_MID}; }}")
+            f"QPushButton:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; }}")
         self._drive_btn.clicked.connect(self._pick_drive)
         lay.addWidget(lbl_row("Drive dest:", self._drive_btn))
 
@@ -4413,7 +4654,9 @@ class WatchEditDialog(QDialog):
         acct_id = self._job.get("drive_account_id", "")
         def _load():
             try:
-                svc = drive_accounts.get_service(acct_id) if acct_id else drivelib.build_thread_service()
+                if not acct_id:
+                    raise RuntimeError("No account selected.")
+                svc = drive_accounts.get_service(acct_id)
                 folders = drivelib.list_folders(svc)
                 self._folders_ready.emit(folders)
             except Exception as e:
@@ -4620,8 +4863,9 @@ class App(QMainWindow):
             zip_on=zip_on,
         )
 
-        job["zip_name"] = spec.get("zip_name", "")
-        job["keep_zip"] = spec.get("keep_zip", False)
+        job["zip_name"]   = spec.get("zip_name", "")
+        job["keep_zip"]   = spec.get("keep_zip", False)
+        job["share_link"] = spec.get("share_link", False)
 
         if source == "manual":
             folder_src = spec.get("folder_src")
@@ -4645,6 +4889,9 @@ class App(QMainWindow):
             job["watch_ignore_hidden"] = spec.get("watch_ignore_hidden", True)
             job["watch_subfolder_zip"] = spec.get("watch_subfolder_zip", False)
             self._start_job_watcher(job)
+
+        # Persist after all fields are set (_create_job saves too early).
+        self._save_jobs()
 
     def _create_job(self, name: str, source: str,
                     drive_account_id: str, drive_folder_id: str,
@@ -4706,9 +4953,15 @@ class App(QMainWindow):
 
             # Restore upload entries for this job
             for entry in entries_by_job.get(job_id, []):
-                if entry.status in ("in_progress", "compressing"):
+                if entry.status == "in_progress":
                     self._state.update(entry.id, status="queued")
                     entry.status = "queued"
+                elif entry.status == "compressing":
+                    # Zip was never finished — the temp zip doesn't exist.
+                    # Can't resume compression; mark failed so the user re-queues.
+                    self._state.update(entry.id, status="failed",
+                                       error="Compression interrupted — please re-upload")
+                    entry.status = "failed"
                 tile.add_file(entry)
 
             # Restart watch watcher (respects stopped state from previous session)
@@ -4767,17 +5020,6 @@ class App(QMainWindow):
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
 
-    def _add_folder_for_job(self, folder_path: str, job: dict):
-        folder_name = Path(folder_path).name
-        from PyQt6.QtWidgets import QMessageBox as _MB
-        reply = _MB.question(self, "Upload Folder",
-                             f'How to upload "{folder_name}"?',
-                             "Compress to ZIP", "Keep Structure", None, 0, 1)
-        if reply == 0:
-            self._add_folder_as_zip(folder_path, job)
-        else:
-            self._add_folder_as_structure(folder_path, job)
-
     def _add_folder_as_zip(self, folder_path: str, job: dict):
         folder_name = Path(folder_path).name
         folder_id   = job.get("drive_folder_id", "")
@@ -4803,26 +5045,39 @@ class App(QMainWindow):
         t.start()
 
     def _add_folder_as_structure(self, folder_path: str, job: dict):
+        self._log(f"_add_folder_as_structure: {folder_path}")
         if not self._drive_service:
+            self._log("_add_folder_as_structure: Drive not connected — aborting")
             self._show_notice("Drive not connected yet. Please wait and try again.")
             return
         threading.Thread(target=self._prepare_folder_structure,
                          args=(folder_path, job), daemon=True).start()
 
     def _prepare_folder_structure(self, folder_path: str, job: dict):
+        # job_id hoisted so the except block can reference it even if the
+        # try block fails before assigning it.
+        job_id = job.get("id", "")
+        self._log(f"_prepare_folder_structure started: {folder_path}")
         try:
             folder_name    = Path(folder_path).name
             parent_id      = job.get("drive_folder_id", "")
             parent_display = job.get("drive_folder_name", "")
-            job_id         = job.get("id", "")
             job_account    = job.get("drive_account_id", "")
-            if not job_account or not drive_accounts.token_path(job_account).exists():
+            if not job_account or not drive_accounts.has_token(job_account):
                 self._progress_queue.put(("file_error", job_id,
                                           "No Drive account configured for this job"))
                 return
+            share_link    = bool(job.get("share_link", False))
             svc = drive_accounts.build_thread_service(job_account)
             root_drive_id = drivelib.create_drive_folder(svc, folder_name, parent_id)
             root_display  = f"{parent_display} / {folder_name}"
+            if share_link:
+                try:
+                    drivelib.set_anyone_can_view(svc, root_drive_id)
+                    self._log(f"Public link set on folder: drive.google.com/drive/folders/{root_drive_id}")
+                except Exception as _se:
+                    self._log(f"Public link FAILED on folder: {_se}")
+                    self._progress_queue.put(("share_err", job_id, str(_se), ""))
             folder_map = {folder_path: root_drive_id}
             for dirpath, dirnames, _ in os.walk(folder_path):
                 parent_local = str(Path(dirpath).parent)
@@ -4830,31 +5085,44 @@ class App(QMainWindow):
                     sub_id = drivelib.create_drive_folder(
                         svc, Path(dirpath).name, folder_map[parent_local])
                     folder_map[dirpath] = sub_id
+            # Build relative-path display names for each subfolder.
+            # group_name is relative to folder_path's parent so the root folder
+            # name appears at the top level (e.g. "Powergrade Stills") and
+            # subfolders appear as "Powergrade Stills/CLIP PRESETS".
+            root_parent = str(Path(folder_path).parent)
             entries = []
+            skipped = []
             for dirpath, _, filenames in os.walk(folder_path):
+                if not filenames:
+                    continue
+                dir_str  = str(dirpath)
+                dir_id   = folder_map.get(dir_str, root_drive_id)
+                try:
+                    rel_name = str(Path(dirpath).relative_to(root_parent))
+                except ValueError:
+                    rel_name = Path(dirpath).name
                 for fn in filenames:
                     fp = os.path.join(dirpath, fn)
                     try:
                         size = os.path.getsize(fp)
-                    except OSError:
+                    except OSError as _e:
+                        skipped.append((fp, str(_e)))
+                        self._log(f"Skipped (unreadable): {fp} — {_e}")
                         continue
-                    dir_id = folder_map.get(str(Path(fp).parent), root_drive_id)
-                    entry = UploadEntry.new(fp, size, dir_id, root_display)
+                    entry = UploadEntry.new(fp, size, dir_id, root_display,
+                                            group_id=dir_str,
+                                            group_name=rel_name)
                     entry.job_id = job_id
                     entries.append(entry)
 
-            def _add_to_ui():
-                tile = self._job_tiles.get(job_id)
-                for entry in entries:
-                    self._state.add(entry)
-                    if tile:
-                        tile.add_file(entry)
-                self._start_next_uploads()
-
-            QTimer.singleShot(0, _add_to_ui)
+            # Signal via the progress queue — the main thread polls this every
+            # 150ms. QTimer.singleShot from a non-Qt background thread is
+            # unreliable (no event loop in the calling thread), so don't use it.
+            self._progress_queue.put(("folder_structure_ready", job_id, entries, list(skipped), root_drive_id, folder_name))
         except Exception as e:
-            QTimer.singleShot(0, lambda: self._show_notice(
-                f"Failed to create folder structure in Drive:\n{e}"))
+            import traceback as _tb
+            self._log(f"_prepare_folder_structure ERROR: {e}\n{_tb.format_exc()}")
+            self._progress_queue.put(("folder_structure_error", job_id, str(e)))
 
     # ── Watch jobs ─────────────────────────────────────────────────────────────
 
@@ -5071,6 +5339,9 @@ class App(QMainWindow):
             if t_up:
                 t_up[1].set()
             self._upload_account.pop(entry.id, None)
+            # Mark pending entries failed so they don't resurface as orphans on restart
+            if entry.status in ("queued", "in_progress", "compressing", "paused"):
+                self._state.update(entry.id, status="failed", error="Job removed")
         self._queue_panel.remove_tile(job_id)
         self._job_tiles.pop(job_id, None)
         self._jobs.pop(job_id, None)
@@ -5115,9 +5386,12 @@ class App(QMainWindow):
             if not account_id:
                 account_id = self._cfg.get("active_drive_account_id", "")
 
+            job_for_entry = self._jobs.get(entry.job_id, {}) if entry.job_id else {}
+            share_link = job_for_entry.get("share_link", False)
             stop_event = threading.Event()
             worker = UploadWorker(entry, self._state, self._progress_queue,
-                                  stop_event, account_id=account_id)
+                                  stop_event, account_id=account_id,
+                                  share_link=share_link)
             t = threading.Thread(target=worker.run, daemon=True)
             self._active_workers[entry.id]    = (t, stop_event)
             self._upload_account[entry.id]    = account_id
@@ -5218,6 +5492,37 @@ class App(QMainWindow):
                 elif kind == "zip_cancelled":
                     self._active_zip_workers.pop(entry_id, None)
                     self._call_file_row(entry_id, "set_failed", "Cancelled")
+                elif kind == "share_ok":
+                    self._log(f"Public link set: drive.google.com/file/d/{msg[2]}/view")
+                elif kind == "share_err":
+                    self._log(f"Public link FAILED: {msg[2]}")
+                    QMessageBox.warning(self, "Public Link Failed",
+                        f"Could not set public link on Drive file.\n\n{msg[2]}")
+                elif kind == "folder_structure_ready":
+                    # Emitted by _prepare_folder_structure background thread.
+                    f_job_id  = msg[1]
+                    f_entries = msg[2]
+                    f_skipped = msg[3]
+                    f_root_id = msg[4] if len(msg) > 4 else ""
+                    f_fname   = msg[5] if len(msg) > 5 else ""
+                    f_tile = self._job_tiles.get(f_job_id)
+                    added = 0
+                    for f_entry in f_entries:
+                        if self._state.add(f_entry):
+                            added += 1
+                        if f_tile:
+                            f_tile.add_file(f_entry)
+                    if f_tile and f_root_id:
+                        f_tile.set_folder_drive_id(f_root_id, f_fname)
+                    self._log(f"Folder queued: {added} files added, {len(f_skipped)} skipped")
+                    if f_skipped:
+                        names = "\n".join(Path(p).name for p, _ in f_skipped[:5])
+                        extra = f"\n…and {len(f_skipped)-5} more" if len(f_skipped) > 5 else ""
+                        self._show_notice(
+                            f"{len(f_skipped)} file(s) could not be read and were skipped:\n{names}{extra}")
+                    self._start_next_uploads()
+                elif kind == "folder_structure_error":
+                    self._show_notice(f"Failed to create folder structure in Drive:\n{msg[2]}")
                 elif kind == "email_sent":
                     tile = self._job_tiles.get(msg[1])
                     if tile:
@@ -5242,12 +5547,15 @@ class App(QMainWindow):
             try:
                 zip_path = Path(entry.local_path)
                 tmp_dir = zip_path.parent
-                if entry.is_temp_zip:
-                    if "uplift-" in str(tmp_dir):
-                        shutil.rmtree(str(tmp_dir), ignore_errors=True)
+                # SAFETY: only touch directories whose NAME starts with "uplift-".
+                # tempfile.mkdtemp(prefix="uplift-") always produces exactly that.
+                # Source files never live in such a directory, so this guard is absolute.
+                if not tmp_dir.name.startswith("uplift-"):
+                    self._log(f"Cleanup skipped (source file): {zip_path}")
+                elif entry.is_temp_zip:
+                    shutil.rmtree(str(tmp_dir), ignore_errors=True)
                 else:
-                    # keep_zip=True — move zip out of uplift- subdir into its parent
-                    # (for watch jobs the subdir is already in watch_folder/.., so zip lands there)
+                    # keep_zip=True — move zip out of uplift- temp subdir
                     keep_dir = tmp_dir.parent
                     dest = keep_dir / zip_path.name
                     if dest.exists():
@@ -5302,12 +5610,17 @@ class App(QMainWindow):
         to = email_cfg.get("to", "").strip()
         if not to:
             return
+        share_link = bool(job.get("share_link"))
         try:
             svc = drive_accounts.build_thread_service(account_id)
-            svc.permissions().create(
-                fileId=drive_file_id,
-                body={"role": "reader", "type": "anyone"},
-                fields="id", supportsAllDrives=True).execute()
+            # Only set public sharing when the job's Public Link toggle is on.
+            # Constraint: the app must never alter Drive sharing otherwise.
+            # When off, the link still goes out but the file stays restricted.
+            if share_link:
+                svc.permissions().create(
+                    fileId=drive_file_id,
+                    body={"role": "reader", "type": "anyone"},
+                    fields="id", supportsAllDrives=True).execute()
             result = svc.files().get(fileId=drive_file_id,
                                      fields="webViewLink",
                                      supportsAllDrives=True).execute()
