@@ -2,11 +2,16 @@
 # This file is intentionally kept in sync between export-watcher and drive-uploader.
 # When making changes, update both copies.
 # ─────────────────────────────────────────────────────────────────────────────
-"""Named Google Drive accounts stored in ~/.drive-accounts/.
+"""Named Google Drive accounts.
 
-Each account stores its OAuth token on disk (600 permissions) and its
-credentials.json content in the macOS Keychain. Token refresh works
-without credentials.json because token files embed client_id/secret.
+Storage layout:
+  ~/.drive-accounts/index.json      — account list (id, name, email) — not sensitive
+  macOS Keychain "kootenay-drive-accounts"  key=account_id  — credentials.json content
+  macOS Keychain "kootenay-drive-tokens"    key=account_id  — OAuth token JSON
+
+No OAuth tokens or client secrets are written to disk. On first use, any
+legacy token files found in ~/.drive-accounts/ are automatically migrated
+to Keychain and deleted.
 """
 
 import json
@@ -50,7 +55,8 @@ def _build_service(creds):
 ACCOUNTS_DIR = Path.home() / ".drive-accounts"
 INDEX_PATH = ACCOUNTS_DIR / "index.json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-KEYRING_SERVICE = "kootenay-drive-accounts"
+KEYRING_SERVICE        = "kootenay-drive-accounts"  # credentials.json
+TOKEN_KEYRING_SERVICE  = "kootenay-drive-tokens"    # OAuth token JSON
 
 
 # ── Storage helpers ───────────────────────────────────────────────────────────
@@ -76,6 +82,7 @@ def _save_index(accounts: list) -> None:
 
 
 def token_path(account_id: str) -> Path:
+    """Legacy disk path — only used for migration detection."""
     return ACCOUNTS_DIR / f"token_{account_id}.json"
 
 
@@ -91,14 +98,34 @@ def get_account(account_id: str) -> dict | None:
     return None
 
 
+# ── Token Keychain helpers ────────────────────────────────────────────────────
+
+def _save_token(account_id: str, creds: Credentials) -> None:
+    """Persist OAuth token to Keychain (never touches disk)."""
+    keyring.set_password(TOKEN_KEYRING_SERVICE, account_id, creds.to_json())
+
+
+def _load_token(account_id: str) -> Credentials | None:
+    """Load OAuth token from Keychain, migrating from legacy disk file if present."""
+    token_json = keyring.get_password(TOKEN_KEYRING_SERVICE, account_id)
+
+    if not token_json:
+        # One-time migration: move old disk token into Keychain then delete the file.
+        tp = token_path(account_id)
+        if tp.exists():
+            token_json = tp.read_text()
+            keyring.set_password(TOKEN_KEYRING_SERVICE, account_id, token_json)
+            tp.unlink()
+        else:
+            return None
+
+    return Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+
+
 # ── Account management ────────────────────────────────────────────────────────
 
 def add_account(source_credentials_path, display_name: str = "") -> dict:
-    """Run OAuth flow, save token + credentials, return account dict.
-
-    source_credentials_path: path to the app's credentials.json (used for OAuth).
-    A copy is stored alongside the token so refresh works from any app.
-    """
+    """Run OAuth flow, save token to Keychain, return account dict."""
     _ensure()
     flow = InstalledAppFlow.from_client_secrets_file(
         str(source_credentials_path), SCOPES
@@ -113,8 +140,7 @@ def add_account(source_credentials_path, display_name: str = "") -> dict:
     )
 
     account_id = uuid.uuid4().hex[:8]
-    token_path(account_id).write_text(creds.to_json())
-    os.chmod(token_path(account_id), 0o600)
+    _save_token(account_id, creds)
     keyring.set_password(KEYRING_SERVICE, account_id, Path(source_credentials_path).read_text())
 
     existing = list_accounts()
@@ -129,14 +155,21 @@ def add_account(source_credentials_path, display_name: str = "") -> dict:
 
 
 def remove_account(account_id: str) -> None:
-    """Delete an account, its token file, and its Keychain entry."""
+    """Delete an account and all its Keychain entries."""
     _save_index([a for a in list_accounts() if a["id"] != account_id])
-    token_path(account_id).unlink(missing_ok=True)
-    credentials_path(account_id).unlink(missing_ok=True)  # backward compat
+    # Remove token from Keychain
+    try:
+        keyring.delete_password(TOKEN_KEYRING_SERVICE, account_id)
+    except Exception:
+        pass
+    # Remove credentials from Keychain
     try:
         keyring.delete_password(KEYRING_SERVICE, account_id)
     except Exception:
         pass
+    # Clean up any legacy disk files
+    token_path(account_id).unlink(missing_ok=True)
+    credentials_path(account_id).unlink(missing_ok=True)
 
 
 def rename_account(account_id: str, new_name: str) -> None:
@@ -155,23 +188,22 @@ class _TimeoutSession(_requests.Session):
         return super().request(*args, **kwargs)
 
 
-def _refresh_creds(creds, tp):
+def _refresh_creds(creds: Credentials, account_id: str) -> None:
+    """Refresh expired credentials and persist updated token to Keychain."""
     if not creds.valid and creds.expired and creds.refresh_token:
         creds.refresh(Request(session=_TimeoutSession()))
-        tp.write_text(creds.to_json())
+        _save_token(account_id, creds)
 
 
 def get_service(account_id: str):
     """Return an authenticated Drive service for a saved account."""
-    tp = token_path(account_id)
-    creds = Credentials.from_authorized_user_file(str(tp), SCOPES)
-    _refresh_creds(creds, tp)
+    creds = _load_token(account_id)
+    _refresh_creds(creds, account_id)
     return _build_service(creds)
 
 
 def build_thread_service(account_id: str):
     """Return a NEW Drive service for a saved account (requests transport)."""
-    tp = token_path(account_id)
-    creds = Credentials.from_authorized_user_file(str(tp), SCOPES)
-    _refresh_creds(creds, tp)
+    creds = _load_token(account_id)
+    _refresh_creds(creds, account_id)
     return _build_service(creds)
