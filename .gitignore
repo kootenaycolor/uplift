@@ -6,6 +6,7 @@ token.json
 dist/
 build/
 *.spec
+launcher_stub.c
 
 # Python cache
 __pycache__/

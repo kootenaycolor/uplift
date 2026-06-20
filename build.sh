@@ -137,8 +137,7 @@ if [ -f "$SCRIPT_DIR/design/uplift.icns" ]; then
 fi
 
 # ── Source files ────────────────────────────────────────────────────────────
-# Copy main_qt.py as main.py (the C launcher always calls main.py)
-cp "$SCRIPT_DIR/main_qt.py" "$DIST/Contents/Resources/main.py"
+cp "$SCRIPT_DIR/main.py" "$DIST/Contents/Resources/main.py"
 
 for f in drive.py state.py config.py drive_accounts.py mailer.py sender_profile.py; do
   cp "$SCRIPT_DIR/$f" "$DIST/Contents/Resources/"
