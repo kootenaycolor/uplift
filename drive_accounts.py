@@ -86,6 +86,14 @@ def token_path(account_id: str) -> Path:
     return ACCOUNTS_DIR / f"token_{account_id}.json"
 
 
+def has_token(account_id: str) -> bool:
+    """Return True if a token exists for this account (Keychain or legacy disk)."""
+    return bool(
+        keyring.get_password(TOKEN_KEYRING_SERVICE, account_id)
+        or token_path(account_id).exists()
+    )
+
+
 def credentials_path(account_id: str) -> Path:
     return ACCOUNTS_DIR / f"credentials_{account_id}.json"
 

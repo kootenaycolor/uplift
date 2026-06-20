@@ -248,10 +248,15 @@ QWidget {{
     font-family: "Proxima Nova", "Trebuchet MS", Arial, sans-serif;
     font-size: 13px;
     color: {ink};
+    background-color: transparent;
 }}
 
-/* Main window transparent — NSGlassEffectView shows through */
-QMainWindow, QMainWindow > QWidget {{
+/* Main window solid background — prevents macOS compositor double-layer artifact */
+QMainWindow {{
+    background-color: {bg};
+    color: {ink};
+}}
+QMainWindow > QWidget {{
     background-color: transparent;
     color: {ink};
 }}
@@ -2926,12 +2931,6 @@ class JobTile(QFrame):
         self._rows: dict[str, FileRow] = {}
         self._expanded = True
 
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(10)
-        shadow.setColor(QColor(0, 0, 0, 15))
-        shadow.setOffset(0, 2)
-        self.setGraphicsEffect(shadow)
-
         source       = self._job.get("source", "manual")
         accent_color = TEAL if source == "watch" else STONE
 
@@ -4522,10 +4521,7 @@ class App(QMainWindow):
         self.setWindowTitle("Uplift")
         self.resize(980, 740)
         self.setMinimumSize(820, 560)
-        # Prevent QMainWindow from painting its own gray background;
-        # the panels provide all visible surfaces via glass or solid fills.
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("QMainWindow { background: transparent; }")
+        pass  # window background set by global QSS (_build_app_qss)
 
         _load_fonts()
         global _IS_DARK
@@ -4568,11 +4564,10 @@ class App(QMainWindow):
 
     def _build_ui(self):
         central = QWidget()
-        central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         self._creation_panel = JobCreationPanel(self._cfg, app=self)
         self._creation_panel.job_requested.connect(self._on_job_requested)
@@ -4716,9 +4711,13 @@ class App(QMainWindow):
                     entry.status = "queued"
                 tile.add_file(entry)
 
-            # Restart watch watcher
+            # Restart watch watcher (respects stopped state from previous session)
             if job.get("source") == "watch":
-                self._start_job_watcher(job)
+                if job.get("watch_running", True):
+                    self._start_job_watcher(job)
+                else:
+                    tile.set_watch_stopped()
+                    tile.set_watch_status("Watching stopped", STONE)
 
         # Kick off any queued uploads
         self._start_next_uploads()
@@ -4968,12 +4967,12 @@ class App(QMainWindow):
     def _init_drive(self):
         accounts   = drive_accounts.list_accounts()
         account_id = self._cfg.get("active_drive_account_id", "")
-        if account_id and drive_accounts.token_path(account_id).exists():
+        if account_id and drive_accounts.has_token(account_id):
             active_id = account_id
         else:
             active_id = next(
                 (a["id"] for a in accounts
-                 if drive_accounts.token_path(a["id"]).exists()), None)
+                 if drive_accounts.has_token(a["id"])), None)
 
         if not active_id:
             self._creation_panel.update_status(
@@ -5035,6 +5034,10 @@ class App(QMainWindow):
         watcher = self._watch_watchers.pop(job_id, None)
         if watcher:
             watcher.stop()
+        job = self._jobs.get(job_id)
+        if job:
+            job["watch_running"] = False
+            self._save_jobs()
         tile = self._job_tiles.get(job_id)
         if tile:
             tile.set_watch_stopped()
@@ -5046,6 +5049,8 @@ class App(QMainWindow):
         job = self._jobs.get(job_id)
         if not job:
             return
+        job["watch_running"] = True
+        self._save_jobs()
         self._start_job_watcher(job)
         tile = self._job_tiles.get(job_id)
         if tile:
@@ -5614,13 +5619,6 @@ if __name__ == "__main__":
         pass
     window = App()
 
-    try:
-        import pyqt_liquidglass as lg
-        window.prepare_glass_panels()
-        lg.prepare_window_for_glass(window)
-        QTimer.singleShot(100, window.apply_glass_panels)
-        lg.setup_traffic_lights_inset(window, x_offset=20, y_offset=10)
-    except Exception:
-        window.show()
+    window.show()
 
     sys.exit(app.exec())
