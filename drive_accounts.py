@@ -5,18 +5,22 @@
 """Named Google Drive accounts.
 
 Storage layout:
-  ~/.drive-accounts/index.json      — account list (id, name, email) — not sensitive
+  ~/.drive-accounts/index.json          — account list (id, name, email) — not sensitive
+  ~/.drive-accounts/.token_cache.json   — token cache (chmod 600), refreshed from Keychain weekly
   macOS Keychain "kootenay-drive-accounts"  key=account_id  — credentials.json content
-  macOS Keychain "kootenay-drive-tokens"    key=account_id  — OAuth token JSON
+  macOS Keychain "kootenay-drive-tokens"    key=account_id  — OAuth token JSON (source of truth)
 
-No OAuth tokens or client secrets are written to disk. On first use, any
-legacy token files found in ~/.drive-accounts/ are automatically migrated
-to Keychain and deleted.
+No OAuth tokens or client secrets are written to disk except the cache file,
+which is chmod 600 and refreshed from Keychain at most once per week.
+On first use, any legacy token files found in ~/.drive-accounts/ are automatically
+migrated to Keychain and deleted.
 """
 
 import json
 import keyring
 import os
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -53,10 +57,17 @@ def _build_service(creds):
     return build("drive", "v3", http=_RequestsHttp(creds))
 
 ACCOUNTS_DIR = Path.home() / ".drive-accounts"
-INDEX_PATH = ACCOUNTS_DIR / "index.json"
+INDEX_PATH   = ACCOUNTS_DIR / "index.json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-KEYRING_SERVICE        = "kootenay-drive-accounts"  # credentials.json
-TOKEN_KEYRING_SERVICE  = "kootenay-drive-tokens"    # OAuth token JSON
+KEYRING_SERVICE       = "kootenay-drive-accounts"   # credentials.json
+TOKEN_KEYRING_SERVICE = "kootenay-drive-tokens"     # OAuth token JSON
+
+DISK_CACHE_PATH    = ACCOUNTS_DIR / ".token_cache.json"
+DISK_CACHE_MAX_AGE = 7 * 24 * 3600   # re-read Keychain after 7 days
+
+# In-memory token JSON cache — avoids repeated Keychain reads within a session.
+_token_cache: dict[str, str] = {}   # account_id -> token JSON string
+_token_cache_lock = threading.Lock()
 
 
 # ── Storage helpers ───────────────────────────────────────────────────────────
@@ -87,7 +98,14 @@ def token_path(account_id: str) -> Path:
 
 
 def has_token(account_id: str) -> bool:
-    """Return True if a token exists for this account (Keychain or legacy disk)."""
+    """Return True if a token exists for this account."""
+    with _token_cache_lock:
+        if account_id in _token_cache:
+            return True
+    # Check disk cache before touching Keychain
+    disk = _read_disk_cache()
+    if account_id in disk:
+        return True
     return bool(
         keyring.get_password(TOKEN_KEYRING_SERVICE, account_id)
         or token_path(account_id).exists()
@@ -106,17 +124,57 @@ def get_account(account_id: str) -> dict | None:
     return None
 
 
+# ── Disk token cache (chmod 600, refreshed from Keychain weekly) ──────────────
+
+def _read_disk_cache() -> dict:
+    """Return {account_id: {token_json, cached_at}} or {}."""
+    try:
+        return json.loads(DISK_CACHE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _write_disk_cache(cache: dict) -> None:
+    try:
+        _ensure()
+        DISK_CACHE_PATH.write_text(json.dumps(cache))
+        os.chmod(DISK_CACHE_PATH, 0o600)
+    except Exception:
+        pass
+
+
 # ── Token Keychain helpers ────────────────────────────────────────────────────
 
 def _save_token(account_id: str, creds: Credentials) -> None:
-    """Persist OAuth token to Keychain (never touches disk)."""
-    keyring.set_password(TOKEN_KEYRING_SERVICE, account_id, creds.to_json())
+    """Persist OAuth token to Keychain, in-memory cache, and disk cache."""
+    token_json = creds.to_json()
+    keyring.set_password(TOKEN_KEYRING_SERVICE, account_id, token_json)
+    with _token_cache_lock:
+        _token_cache[account_id] = token_json
+    disk = _read_disk_cache()
+    disk[account_id] = {"token_json": token_json, "cached_at": time.time()}
+    _write_disk_cache(disk)
 
 
 def _load_token(account_id: str) -> Credentials | None:
-    """Load OAuth token from Keychain, migrating from legacy disk file if present."""
-    token_json = keyring.get_password(TOKEN_KEYRING_SERVICE, account_id)
+    """Load OAuth token: in-memory → disk cache → Keychain (at most once per week)."""
+    # 1. In-memory (fastest, no I/O)
+    with _token_cache_lock:
+        token_json = _token_cache.get(account_id)
+    if token_json:
+        return Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
 
+    # 2. Disk cache (survives restarts, avoids Keychain if fresh)
+    disk = _read_disk_cache()
+    entry = disk.get(account_id)
+    if entry and time.time() - entry.get("cached_at", 0) < DISK_CACHE_MAX_AGE:
+        token_json = entry["token_json"]
+        with _token_cache_lock:
+            _token_cache[account_id] = token_json
+        return Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+
+    # 3. Keychain (once per week per account)
+    token_json = keyring.get_password(TOKEN_KEYRING_SERVICE, account_id)
     if not token_json:
         # One-time migration: move old disk token into Keychain then delete the file.
         tp = token_path(account_id)
@@ -127,7 +185,21 @@ def _load_token(account_id: str) -> Credentials | None:
         else:
             return None
 
+    # Populate both caches so subsequent calls skip Keychain
+    with _token_cache_lock:
+        _token_cache[account_id] = token_json
+    disk[account_id] = {"token_json": token_json, "cached_at": time.time()}
+    _write_disk_cache(disk)
+
     return Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+
+
+def _evict_token_cache(account_id: str) -> None:
+    with _token_cache_lock:
+        _token_cache.pop(account_id, None)
+    disk = _read_disk_cache()
+    disk.pop(account_id, None)
+    _write_disk_cache(disk)
 
 
 # ── Account management ────────────────────────────────────────────────────────
@@ -165,17 +237,15 @@ def add_account(source_credentials_path, display_name: str = "") -> dict:
 def remove_account(account_id: str) -> None:
     """Delete an account and all its Keychain entries."""
     _save_index([a for a in list_accounts() if a["id"] != account_id])
-    # Remove token from Keychain
+    _evict_token_cache(account_id)
     try:
         keyring.delete_password(TOKEN_KEYRING_SERVICE, account_id)
     except Exception:
         pass
-    # Remove credentials from Keychain
     try:
         keyring.delete_password(KEYRING_SERVICE, account_id)
     except Exception:
         pass
-    # Clean up any legacy disk files
     token_path(account_id).unlink(missing_ok=True)
     credentials_path(account_id).unlink(missing_ok=True)
 
@@ -197,7 +267,7 @@ class _TimeoutSession(_requests.Session):
 
 
 def _refresh_creds(creds: Credentials, account_id: str) -> None:
-    """Refresh expired credentials and persist updated token to Keychain."""
+    """Refresh expired credentials and persist updated token to Keychain and caches."""
     if not creds.valid and creds.expired and creds.refresh_token:
         creds.refresh(Request(session=_TimeoutSession()))
         _save_token(account_id, creds)

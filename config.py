@@ -28,6 +28,15 @@ DEFAULTS = {
     # None = not yet migrated; [] = migrated with no items
     "presets": None,
     "watches": None,
+    # Email preset keys — must be in DEFAULTS so the whitelist preserves them on save/load
+    "email_body_templates": [],
+    "email_recipient_presets": [],
+    "email_timing_presets_watch": [],
+    "email_timing_presets_manual": [],
+    "email_timing_presets": [],          # referenced by migration; kept for safety
+    "_email_preset_migration_done": False,
+    # User-configured zip scratch directories
+    "zip_scratch_dirs": [],
     # Legacy keys kept for migration only — not used by current code
     "drive_folder_id": "",
     "drive_folder_name": "",

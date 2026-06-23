@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Uplift v2 — PyQt6 port of main.py"""
 
+import errno
 import json
 import os
+from enum import Enum, auto
 import queue
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -18,7 +21,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QSize, QTimer, QPropertyAnimation, QEasingCurve,
-    pyqtSignal, QPointF, QRectF,
+    pyqtSignal, QPointF, QRectF, QObject, QEvent,
 )
 from PyQt6.QtGui import (
     QColor, QFont, QFontDatabase, QPainter, QPainterPath,
@@ -197,7 +200,8 @@ EMAIL_BODY_DEFAULT = "Hi,\n\nYour file is ready to download:\n{link}\n\nBest,\n{
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mxf", ".r3d", ".braw", ".mkv",
                     ".avi", ".prores", ".dng"}
-LOG_PATH  = Path.home() / ".uplift-log.txt"
+LOG_PATH       = Path.home() / ".uplift-log.txt"
+CRASH_LOG_PATH = Path.home() / ".uplift-crash.log"
 JOBS_PATH = Path.home() / ".uplift-jobs.json"
 MAX_CONCURRENT = 1
 
@@ -559,7 +563,62 @@ def _fmt_duration(secs: float) -> str:
         m = (secs % 3600) // 60
         return f"{h}h {m}m"
 
-# ── Workers (copied verbatim from main.py logic) ───────────────────────────────
+# ── Watch-job routing ─────────────────────────────────────────────────────────
+
+class WatchAction(Enum):
+    PER_SUBFOLDER_ZIP     = auto()
+    PER_SUBFOLDER_ZIP_LOOSE_ROOT = auto()
+    SINGLE_ZIP_STRUCTURED = auto()
+    SINGLE_ZIP_FLAT       = auto()
+    SINGLE_ZIP_ROOT_ONLY  = auto()
+    UPLOAD_MIRROR         = auto()
+    UPLOAD_FLAT_RECURSIVE = auto()
+    UPLOAD_ROOT_ONLY      = auto()
+
+
+def decide_watch_action(zip_: bool, subfolders: bool,
+                        keep_structure: bool, zip_per_subfolder: bool,
+                        root_individual: bool = False) -> WatchAction:
+    """Pure routing function. Normalizes inputs then returns exactly one Action.
+
+    Normalization (done inside so all call sites agree):
+      if not zip_:       zip_per_subfolder = False
+      if not subfolders: keep_structure    = False
+    """
+    if not zip_:
+        zip_per_subfolder = False
+    if not subfolders:
+        keep_structure = False
+
+    if zip_:
+        if subfolders:
+            if zip_per_subfolder:
+                return (WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT
+                        if root_individual else WatchAction.PER_SUBFOLDER_ZIP)
+            if keep_structure:
+                return WatchAction.SINGLE_ZIP_STRUCTURED
+            return WatchAction.SINGLE_ZIP_FLAT
+        return WatchAction.SINGLE_ZIP_ROOT_ONLY
+    if subfolders:
+        if keep_structure:
+            return WatchAction.UPLOAD_MIRROR
+        return WatchAction.UPLOAD_FLAT_RECURSIVE
+    return WatchAction.UPLOAD_ROOT_ONLY
+
+
+WATCH_ACTION_TEXT: dict[WatchAction, str] = {
+    WatchAction.PER_SUBFOLDER_ZIP:     "Each subfolder is zipped separately and uploaded as its own file.",
+    WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT: "Each subfolder is zipped separately; loose files in the top folder upload individually.",
+    WatchAction.SINGLE_ZIP_STRUCTURED: "Everything is combined into one zip, keeping your folder structure.",
+    WatchAction.SINGLE_ZIP_FLAT:       "Everything is combined into one flat zip (no subfolders inside).",
+    WatchAction.SINGLE_ZIP_ROOT_ONLY:  "Only files in the top folder are zipped into one file.",
+    WatchAction.UPLOAD_MIRROR:         "Files upload individually, recreating your folder structure in Drive.",
+    WatchAction.UPLOAD_FLAT_RECURSIVE: "All files upload individually into one Drive folder (structure flattened).",
+    WatchAction.UPLOAD_ROOT_ONLY:      "Only files in the top folder upload individually.",
+}
+
+
+# ── Workers ────────────────────────────────────────────────────────────────────
 
 class FolderBatchMonitor:
     POLL_INTERVAL = 3
@@ -625,7 +684,7 @@ class FolderBatchMonitor:
             if n == 0:
                 stable_ticks = 0
                 prev = None
-                self._on_status("●  Watching — no video files yet", "dim")
+                self._on_status(f"●  Watching  •  {self._folder.name}", "green")
                 continue
             if snap == prev:
                 stable_ticks += 1
@@ -670,12 +729,29 @@ class SubfolderBatchMonitor:
         self._stop_event   = threading.Event()
         self._thread       = threading.Thread(target=self._run, daemon=True,
                                               name="SubfolderBatchMonitor")
-        # Pre-seed skip with all subfolders that already exist — only NEW ones after
-        # this point should be watched (same pattern as ExportHandler.start_scan)
+        # Snapshot existing subfolders as baselines. We watch them, but only fire
+        # when their content CHANGES from what was already there before the watch
+        # started — so pre-existing files are not re-uploaded.
+        self._existing_baseline: dict[str, dict[str, int]] = {}
         try:
             for f in self._folder.iterdir():
                 if f.is_dir() and not (ignore_hidden and f.name.startswith(".")):
-                    self._skip.add(str(f))
+                    snap: dict[str, int] = {}
+                    try:
+                        for fp in f.rglob("*"):
+                            if not fp.is_file():
+                                continue
+                            if ignore_hidden and fp.name.startswith("."):
+                                continue
+                            if extensions and fp.suffix.lower() not in extensions:
+                                continue
+                            try:
+                                snap[str(fp)] = fp.stat().st_size
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
+                    self._existing_baseline[str(f)] = snap
         except OSError:
             pass
 
@@ -713,7 +789,12 @@ class SubfolderBatchMonitor:
 
     def _run(self):
         needed = max(1, self._stable_secs // self.POLL_INTERVAL)
-        watching: dict[str, dict] = {}  # sf_str -> {"prev": snap|None, "ticks": int}
+        # sf_str -> {"prev": snap|None, "ticks": int, "baseline": snap|None}
+        # baseline is set for pre-existing subfolders; cleared once new content is detected.
+        watching: dict[str, dict] = {}
+        for sf_str, baseline in self._existing_baseline.items():
+            if sf_str not in self._skip:
+                watching[sf_str] = {"prev": baseline, "ticks": 0, "baseline": baseline}
         while not self._stop_event.wait(self.POLL_INTERVAL):
             # Un-skip and reset any previously-processed folder that was deleted —
             # a re-export with the same name should be treated as new.
@@ -727,42 +808,81 @@ class SubfolderBatchMonitor:
             for sf in self._list_subfolders():
                 sf_str = str(sf)
                 if sf_str not in watching:
-                    watching[sf_str] = {"prev": None, "ticks": 0}
+                    watching[sf_str] = {"prev": None, "ticks": 0, "baseline": None}
 
             if not watching:
-                self._on_status("●  Watching — waiting for new subfolders", "dim")
+                self._on_status(f"●  Watching  •  {Path(self._folder).name}", "green")
                 continue
 
             to_fire = []
+            pending_statuses: list[tuple[str, str]] = []  # (msg, color)
+
             for sf_str, state in list(watching.items()):
                 snap = self._snapshot(Path(sf_str))
                 if snap is None:
                     continue
+
+                sf_name = Path(sf_str).name
+                baseline = state.get("baseline")
+
+                # Pre-existing subfolder: wait until content changes from the baseline
+                # snapshot taken at watch-start. Only transition to stabilization once
+                # new files actually appear, so pre-existing content is never uploaded.
+                if baseline is not None:
+                    if snap == baseline:
+                        pending_statuses.append(
+                            (f"●  {sf_name}: watching for new exports…", "dim"))
+                        continue
+                    # New content detected — clear baseline, reset, start stabilization
+                    state["baseline"] = None
+                    state["prev"] = None
+                    state["ticks"] = 0
+
                 if not snap:
                     state["prev"] = snap
                     state["ticks"] = 0
                     continue
                 n = len(snap)
-                sf_name = Path(sf_str).name
                 if snap == state["prev"]:
                     state["ticks"] += 1
                     elapsed = state["ticks"] * self.POLL_INTERVAL
                     if state["ticks"] >= needed:
                         to_fire.append((sf_str, list(snap.keys())))
                     else:
-                        self._on_status(
+                        pending_statuses.append((
                             f"●  {sf_name}: {n} file(s) stable "
-                            f"{elapsed}s / {self._stable_secs}s…", "yellow")
+                            f"{elapsed}s/{self._stable_secs}s…", "yellow"))
                 else:
                     state["ticks"] = 0
                     state["prev"] = snap
-                    self._on_status(f"●  {sf_name}: {n} file(s) exporting…", "yellow")
+                    pending_statuses.append(
+                        (f"●  {sf_name}: {n} file(s) exporting…", "yellow"))
+
+            # Emit one combined status — yellow (active) beats dim (idle)
+            if pending_statuses and not to_fire:
+                active = [(m, c) for m, c in pending_statuses if c != "dim"]
+                if active:
+                    if len(active) == 1:
+                        self._on_status(active[0][0], active[0][1])
+                    else:
+                        names = ", ".join(
+                            m.split(":")[0].lstrip("● ").strip() for m, _ in active)
+                        self._on_status(
+                            f"●  {len(active)} subfolders active: {names}", "yellow")
+                else:
+                    self._on_status(f"●  Watching  •  {Path(self._folder).name}", "green")
 
             for sf_str, files in to_fire:
                 del watching[sf_str]
                 self._skip.add(sf_str)
+                # Filter out files that were already present at watch-start so only
+                # newly-exported content is included in the zip.
+                original_baseline = self._existing_baseline.get(sf_str, {})
+                new_files = [f for f in files if f not in original_baseline]
+                if not new_files:
+                    continue
                 self._on_status(f"●  {Path(sf_str).name}: stable — zipping…", "green")
-                self._on_stable(sf_str, files)
+                self._on_stable(sf_str, new_files)
 
 
 class ExportHandler(FileSystemEventHandler):
@@ -771,15 +891,19 @@ class ExportHandler(FileSystemEventHandler):
     SCAN_INTERVAL = 8  # fallback folder scan in case FSEvents miss events
 
     def __init__(self, on_ready_callback, extensions: set | None = None,
-                 recursive: bool = False, ignore_hidden: bool = True):
+                 recursive: bool = False, ignore_hidden: bool = True,
+                 on_status=None):
         super().__init__()
         self._callback = on_ready_callback
+        self._on_status = on_status or (lambda msg, color: None)
         self._seen: set[str] = set()
         self._extensions = extensions  # None = accept all files
         self._recursive = recursive
         self._ignore_hidden = ignore_hidden
         self._start_time = time.time()
         self._stop_event = threading.Event()
+        self._stabilizing: dict[str, int] = {}  # path -> stable_count
+        self._stab_lock = threading.Lock()
 
     def start_scan(self, folder: str):
         """Pre-seed seen set with existing files, then start polling fallback."""
@@ -859,28 +983,55 @@ class ExportHandler(FileSystemEventHandler):
         threading.Thread(target=self._wait_and_queue, args=(path,), daemon=True).start()
 
     def _wait_and_queue(self, path: str):
+        fname = Path(path).name
         prev_size = -1
         stable_count = 0
         needed = self.STABLE_SECS // self.POLL_INTERVAL
         self._dbg(f"wait_and_queue start: {path} need {needed} stable polls")
-        while not self._stop_event.is_set():
-            try:
-                size = Path(path).stat().st_size
-            except OSError as e:
-                self._dbg(f"wait_and_queue OSError: {e}")
-                return
-            if size == prev_size:
-                stable_count += 1
-                self._dbg(f"wait_and_queue stable {stable_count}/{needed}: {path} size={size}")
-                if stable_count >= needed:
-                    self._dbg(f"STABLE → firing callback: {path}")
-                    self._callback(path)
+        with self._stab_lock:
+            self._stabilizing[path] = 0
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    size = Path(path).stat().st_size
+                except OSError as e:
+                    self._dbg(f"wait_and_queue OSError: {e}")
                     return
-            else:
-                stable_count = 0
-                self._dbg(f"wait_and_queue size change: {path} {prev_size}→{size}")
-                prev_size = size
-            time.sleep(self.POLL_INTERVAL)
+                if size == prev_size:
+                    stable_count += 1
+                    self._dbg(f"wait_and_queue stable {stable_count}/{needed}: {path} size={size}")
+                    with self._stab_lock:
+                        self._stabilizing[path] = stable_count
+                        n = len(self._stabilizing)
+                    elapsed = stable_count * self.POLL_INTERVAL
+                    if n > 1:
+                        self._on_status(
+                            f"●  {n} files stabilizing… {elapsed}s/{self.STABLE_SECS}s", "yellow")
+                    else:
+                        self._on_status(
+                            f"●  {fname}: {elapsed}s/{self.STABLE_SECS}s…", "yellow")
+                    if stable_count >= needed:
+                        self._dbg(f"STABLE → firing callback: {path}")
+                        self._callback(path)
+                        return
+                else:
+                    stable_count = 0
+                    self._dbg(f"wait_and_queue size change: {path} {prev_size}→{size}")
+                    prev_size = size
+                    with self._stab_lock:
+                        self._stabilizing[path] = 0
+                        n = len(self._stabilizing)
+                    if n > 1:
+                        self._on_status(f"●  {n} files detected, exporting…", "yellow")
+                    else:
+                        self._on_status(f"●  {fname}: detected, exporting…", "yellow")
+                time.sleep(self.POLL_INTERVAL)
+        finally:
+            with self._stab_lock:
+                self._stabilizing.pop(path, None)
+                remaining = len(self._stabilizing)
+            if remaining == 0 and not self._stop_event.is_set():
+                self._on_status("", "")
 
 
 class UploadWorker:
@@ -1044,12 +1195,129 @@ class _ZipCancelled(Exception):
     pass
 
 
+class _NoSpaceAnywhere(Exception):
+    def __init__(self, required, last_err=None):
+        self.required = required
+        self.last_err = last_err
+        super().__init__("No storage device has enough free space for this zip")
+
+
+ZIP_SPACE_MARGIN = 0.05
+ZIP_SPACE_MARGIN_MIN = 256 * 1024 * 1024
+
+
+def _estimate_zip_bytes(paths: list[str]) -> int:
+    total = 0
+    for p in paths:
+        try:
+            total += os.path.getsize(p)
+        except OSError:
+            pass
+    return total
+
+
+def _required_bytes(raw_total: int) -> int:
+    return raw_total + max(int(raw_total * ZIP_SPACE_MARGIN), ZIP_SPACE_MARGIN_MIN)
+
+
+def _candidate_scratch_dirs(preferred: str | None,
+                            configured: list[str] | None = None) -> list[str]:
+    cands: list[str] = []
+    def add(path):
+        if path and os.path.isdir(path) and os.access(path, os.W_OK):
+            cands.append(path)
+    add(preferred)
+    for d in (configured or []):
+        add(d)
+    if sys.platform == "darwin":
+        base = "/Volumes"
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base)):
+                add(os.path.join(base, name))
+    elif sys.platform.startswith("win"):
+        import string
+        for L in string.ascii_uppercase:
+            add(f"{L}:\\")
+    else:
+        user = os.environ.get("USER", "")
+        for base in (f"/media/{user}", "/run/media", "/media", "/mnt"):
+            if os.path.isdir(base):
+                for name in sorted(os.listdir(base)):
+                    add(os.path.join(base, name))
+    add(os.path.expanduser("~"))
+    add(tempfile.gettempdir())
+    seen, out = set(), []
+    for p in cands:
+        try:
+            dev = os.stat(p).st_dev
+        except OSError:
+            continue
+        if dev in seen:
+            continue
+        seen.add(dev)
+        out.append(p)
+    return out
+
+
+def _pick_scratch_dir(required: int, preferred: str | None,
+                      configured: list[str] | None,
+                      exclude_devs: set | None = None) -> str | None:
+    exclude_devs = exclude_devs or set()
+    for d in _candidate_scratch_dirs(preferred, configured):
+        try:
+            if os.stat(d).st_dev in exclude_devs:
+                continue
+            if shutil.disk_usage(d).free >= required:
+                return d
+        except OSError:
+            continue
+    return None
+
+
+def _is_enospc(exc: Exception) -> bool:
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOSPC
+
+
+def _build_zip_with_fallback(*, write_entries, raw_total, zip_name, preferred,
+                             configured, pq, entry_id):
+    required = _required_bytes(raw_total)
+    tried_devs: set = set()
+    last_err = None
+    while True:
+        scratch = _pick_scratch_dir(required, preferred, configured, tried_devs)
+        if scratch is None:
+            raise _NoSpaceAnywhere(required, last_err)
+        try:
+            tried_devs.add(os.stat(scratch).st_dev)
+        except OSError:
+            pass
+        tmp_dir = tempfile.mkdtemp(prefix="uplift-", dir=scratch)
+        zip_path = os.path.join(tmp_dir, zip_name)
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+                write_entries(zf)
+            return tmp_dir, zip_path
+        except _ZipCancelled:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
+        except OSError as e:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if not _is_enospc(e):
+                raise
+            last_err = e
+            vol_label = os.path.basename(scratch.rstrip("/\\")) or scratch
+            pq.put(("zip_relocating", entry_id, vol_label))
+
+
 class ZipWorker:
     def __init__(self, folder_path: str, entry_id: str,
                  state: StateManager, pq: queue.Queue,
                  stop_event: threading.Event | None = None,
                  zip_name: str = "", keep_zip: bool = False,
-                 output_dir: str | None = None):
+                 output_dir: str | None = None,
+                 keep_structure: bool = True,
+                 ignore_hidden: bool = False,
+                 scratch_dirs: list[str] | None = None):
         self._folder = folder_path
         self._entry_id = entry_id
         self._state = state
@@ -1058,40 +1326,111 @@ class ZipWorker:
         self._zip_name_override = zip_name  # empty = auto
         self._keep_zip = keep_zip
         self._output_dir = output_dir
+        self._keep_structure = keep_structure
+        self._ignore_hidden = ignore_hidden
+        self._scratch_dirs = scratch_dirs or []
 
     def run(self):
-        tmp_dir = None
         try:
             folder_name = Path(self._folder).name
-            tmp_dir = tempfile.mkdtemp(prefix="uplift-", dir=self._output_dir)
             custom = self._zip_name_override.strip()
             zip_name = (custom if custom.lower().endswith(".zip") else custom + ".zip") if custom else folder_name + ".zip"
-            zip_path = os.path.join(tmp_dir, zip_name)
             all_files = []
-            for root, _, files in os.walk(self._folder):
+            for root, dirnames, files in os.walk(self._folder):
+                if self._ignore_hidden:
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
                 for f in files:
+                    if self._ignore_hidden and f.startswith("."):
+                        continue
                     all_files.append(os.path.join(root, f))
             folder_parent = os.path.dirname(self._folder)
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+            raw_total = _estimate_zip_bytes(all_files)
+            def write_entries(zf):
                 for i, fp in enumerate(all_files):
                     if self._stop.is_set():
                         raise _ZipCancelled()
-                    arcname = os.path.relpath(fp, folder_parent)
+                    arcname = (os.path.relpath(fp, folder_parent)
+                               if self._keep_structure else Path(fp).name)
                     zf.write(fp, arcname)
                     self._pq.put(("zip_progress", self._entry_id, i + 1, len(all_files)))
+            tmp_dir, zip_path = _build_zip_with_fallback(
+                write_entries=write_entries, raw_total=raw_total, zip_name=zip_name,
+                preferred=self._output_dir, configured=self._scratch_dirs,
+                pq=self._pq, entry_id=self._entry_id)
             zip_size = os.path.getsize(zip_path)
             self._state.update(self._entry_id, status="queued", local_path=zip_path,
                                file_name=zip_name, file_size=zip_size,
                                is_temp_zip=not self._keep_zip)
             self._pq.put(("zip_done", self._entry_id, zip_path, zip_size, zip_name))
         except _ZipCancelled:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
             self._state.update(self._entry_id, status="failed", error="Cancelled")
             self._pq.put(("zip_cancelled", self._entry_id))
+        except _NoSpaceAnywhere as e:
+            avail = max(
+                (shutil.disk_usage(d).free for d in _candidate_scratch_dirs(self._output_dir, self._scratch_dirs) if os.path.isdir(d)),
+                default=0)
+            msg = (f"Not enough disk space (need {e.required / 1e9:.1f} GB, "
+                   f"largest free {avail / 1e9:.1f} GB)")
+            self._state.update(self._entry_id, status="failed", error=msg)
+            self._pq.put(("error", self._entry_id, msg))
         except Exception as e:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._state.update(self._entry_id, status="failed", error=str(e))
+            self._pq.put(("error", self._entry_id, str(e)))
+
+
+class ComboZipWorker:
+    """Zips an explicit list of (absolute_path, arcname) pairs into ONE archive.
+
+    Used for manual uploads when Zip is on: loose files land at the zip root and
+    each selected folder is preserved (with subfolders when keep_structure is on)
+    inside the same archive. Mirrors ListZipWorker's queue/state contract.
+    """
+    def __init__(self, entries: list, zip_name: str, entry_id: str,
+                 state: StateManager, pq: queue.Queue,
+                 stop_event: threading.Event | None = None,
+                 keep_zip: bool = False,
+                 output_dir: str | None = None,
+                 scratch_dirs: list[str] | None = None):
+        self._entries = entries
+        self._zip_name = zip_name
+        self._entry_id = entry_id
+        self._state = state
+        self._pq = pq
+        self._stop = stop_event or threading.Event()
+        self._keep_zip = keep_zip
+        self._output_dir = output_dir
+        self._scratch_dirs = scratch_dirs or []
+
+    def run(self):
+        try:
+            raw_total = _estimate_zip_bytes([fp for fp, _ in self._entries])
+            def write_entries(zf):
+                for i, (fp, arcname) in enumerate(self._entries):
+                    if self._stop.is_set():
+                        raise _ZipCancelled()
+                    zf.write(fp, arcname)
+                    self._pq.put(("zip_progress", self._entry_id, i + 1, len(self._entries)))
+            tmp_dir, zip_path = _build_zip_with_fallback(
+                write_entries=write_entries, raw_total=raw_total, zip_name=self._zip_name,
+                preferred=self._output_dir, configured=self._scratch_dirs,
+                pq=self._pq, entry_id=self._entry_id)
+            zip_size = os.path.getsize(zip_path)
+            self._state.update(self._entry_id, status="queued", local_path=zip_path,
+                               file_name=self._zip_name, file_size=zip_size,
+                               is_temp_zip=not self._keep_zip)
+            self._pq.put(("zip_done", self._entry_id, zip_path, zip_size, self._zip_name))
+        except _ZipCancelled:
+            self._state.update(self._entry_id, status="failed", error="Cancelled")
+            self._pq.put(("zip_cancelled", self._entry_id))
+        except _NoSpaceAnywhere as e:
+            avail = max(
+                (shutil.disk_usage(d).free for d in _candidate_scratch_dirs(self._output_dir, self._scratch_dirs) if os.path.isdir(d)),
+                default=0)
+            msg = (f"Not enough disk space (need {e.required / 1e9:.1f} GB, "
+                   f"largest free {avail / 1e9:.1f} GB)")
+            self._state.update(self._entry_id, status="failed", error=msg)
+            self._pq.put(("error", self._entry_id, msg))
+        except Exception as e:
             self._state.update(self._entry_id, status="failed", error=str(e))
             self._pq.put(("error", self._entry_id, str(e)))
 
@@ -1101,7 +1440,10 @@ class ListZipWorker:
                  state: StateManager, pq: queue.Queue,
                  stop_event: threading.Event | None = None,
                  keep_zip: bool = False,
-                 output_dir: str | None = None):
+                 output_dir: str | None = None,
+                 keep_structure: bool = False,
+                 base_path: str = "",
+                 scratch_dirs: list[str] | None = None):
         self._files = file_paths
         self._zip_name = zip_name
         self._entry_id = entry_id
@@ -1110,31 +1452,43 @@ class ListZipWorker:
         self._stop = stop_event or threading.Event()
         self._keep_zip = keep_zip
         self._output_dir = output_dir
+        self._keep_structure = keep_structure
+        self._base_path = base_path  # relpath root; only used when keep_structure=True
+        self._scratch_dirs = scratch_dirs or []
 
     def run(self):
-        tmp_dir = None
         try:
-            tmp_dir = tempfile.mkdtemp(prefix="uplift-", dir=self._output_dir)
-            zip_path = os.path.join(tmp_dir, self._zip_name)
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+            raw_total = _estimate_zip_bytes(self._files)
+            def write_entries(zf):
                 for i, fp in enumerate(self._files):
                     if self._stop.is_set():
                         raise _ZipCancelled()
-                    zf.write(fp, Path(fp).name)
+                    arcname = (os.path.relpath(fp, self._base_path)
+                               if self._keep_structure and self._base_path
+                               else Path(fp).name)
+                    zf.write(fp, arcname)
                     self._pq.put(("zip_progress", self._entry_id, i + 1, len(self._files)))
+            tmp_dir, zip_path = _build_zip_with_fallback(
+                write_entries=write_entries, raw_total=raw_total, zip_name=self._zip_name,
+                preferred=self._output_dir, configured=self._scratch_dirs,
+                pq=self._pq, entry_id=self._entry_id)
             zip_size = os.path.getsize(zip_path)
             self._state.update(self._entry_id, status="queued", local_path=zip_path,
                                file_name=self._zip_name, file_size=zip_size,
                                is_temp_zip=not self._keep_zip)
             self._pq.put(("zip_done", self._entry_id, zip_path, zip_size, self._zip_name))
         except _ZipCancelled:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
             self._state.update(self._entry_id, status="failed", error="Cancelled")
             self._pq.put(("zip_cancelled", self._entry_id))
+        except _NoSpaceAnywhere as e:
+            avail = max(
+                (shutil.disk_usage(d).free for d in _candidate_scratch_dirs(self._output_dir, self._scratch_dirs) if os.path.isdir(d)),
+                default=0)
+            msg = (f"Not enough disk space (need {e.required / 1e9:.1f} GB, "
+                   f"largest free {avail / 1e9:.1f} GB)")
+            self._state.update(self._entry_id, status="failed", error=msg)
+            self._pq.put(("error", self._entry_id, msg))
         except Exception as e:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
             self._state.update(self._entry_id, status="failed", error=str(e))
             self._pq.put(("error", self._entry_id, str(e)))
 
@@ -1149,6 +1503,7 @@ class JobWatcher:
         self._export_handler: ExportHandler | None = None
         self._folder_monitor: FolderBatchMonitor | None = None
         self._subfolder_monitor: SubfolderBatchMonitor | None = None
+        self._root_file_monitor: FolderBatchMonitor | None = None
         self._batched_paths: set[str] = set()
 
     @property
@@ -1160,27 +1515,41 @@ class JobWatcher:
         if not folder or not Path(folder).is_dir():
             self._on_status("⚠  Invalid watch folder", _th_yellow(), self.job_id)
             return
-        jid          = self.job_id
-        recursive    = bool(self._job.get("watch_recursive", False))
-        extensions   = set(self._job.get("watch_extensions") or []) or None
+        jid           = self.job_id
+        extensions    = set(self._job.get("watch_extensions") or []) or None
         ignore_hidden = bool(self._job.get("watch_ignore_hidden", True))
-        batch_mode   = bool(self._job.get("watch_batch_mode"))
-        name         = Path(folder).name
+        name          = Path(folder).name
 
-        if batch_mode and bool(self._job.get("watch_subfolder_zip")):
-            # Per-subfolder zip: each new subfolder gets its own zip named after it.
+        action = decide_watch_action(
+            zip_=bool(self._job.get("watch_batch_mode")),
+            subfolders=bool(self._job.get("watch_recursive", False)),
+            keep_structure=bool(self._job.get("watch_keep_structure", True)),
+            zip_per_subfolder=bool(self._job.get("watch_subfolder_zip", False)),
+            root_individual=bool(self._job.get("watch_root_individual", False)),
+        )
+
+        if action in (WatchAction.PER_SUBFOLDER_ZIP,
+                      WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT):
             self._start_subfolder_monitor(folder)
-        elif batch_mode:
-            # Whole-folder batch zip: wait for all files to stabilize, zip together.
-            self._start_folder_monitor(folder)
+        elif action in (WatchAction.SINGLE_ZIP_STRUCTURED,
+                        WatchAction.SINGLE_ZIP_FLAT,
+                        WatchAction.SINGLE_ZIP_ROOT_ONLY):
+            self._start_folder_monitor(folder, action)
         else:
-            # File-by-file mode: watchdog + polling fallback, upload each file as stable.
+            # UPLOAD_MIRROR, UPLOAD_FLAT_RECURSIVE, UPLOAD_ROOT_ONLY
+            recursive = action in (WatchAction.UPLOAD_MIRROR,
+                                   WatchAction.UPLOAD_FLAT_RECURSIVE)
+            idle_msg = f"●  Watching  •  {name}"
+            def _eh_status(msg: str, color: str):
+                self._on_status(msg if msg else idle_msg,
+                                color if color else _th_green(), jid)
             self._export_handler = ExportHandler(
                 lambda path: self._on_file_ready(path, jid),
                 extensions=extensions, recursive=recursive,
-                ignore_hidden=ignore_hidden)
+                ignore_hidden=ignore_hidden,
+                on_status=_eh_status)
             self._observer = Observer()
-            self._export_handler.start_scan(folder)   # pre-seed _seen before observer fires events
+            self._export_handler.start_scan(folder)
             self._observer.schedule(self._export_handler, folder, recursive=recursive)
             self._observer.start()
 
@@ -1200,6 +1569,9 @@ class JobWatcher:
         if self._subfolder_monitor:
             self._subfolder_monitor.stop()
             self._subfolder_monitor = None
+        if self._root_file_monitor:
+            self._root_file_monitor.stop()
+            self._root_file_monitor = None
         self._batched_paths.clear()
         self._on_status("Stopped", STONE, self.job_id)
 
@@ -1208,14 +1580,17 @@ class JobWatcher:
         self._job = dict(updated_job)
         self.start()
 
-    def _start_folder_monitor(self, folder: str):
+    def _start_folder_monitor(self, folder: str,
+                              action: WatchAction = WatchAction.SINGLE_ZIP_FLAT):
         if self._folder_monitor:
             self._folder_monitor.stop()
         stable_secs   = int(self._job.get("watch_batch_stable_secs", 15))
         delay_secs    = int(self._job.get("watch_delay_secs", 0))
         extensions    = set(self._job.get("watch_extensions") or []) or None
-        recursive     = bool(self._job.get("watch_recursive", False))
         ignore_hidden = bool(self._job.get("watch_ignore_hidden", True))
+        # Recursive driven by Action, not the raw toggle, so FolderBatchMonitor
+        # always collects the right files regardless of how watch_recursive is stored.
+        recursive = (action != WatchAction.SINGLE_ZIP_ROOT_ONLY)
         jid = self.job_id
         self._folder_monitor = FolderBatchMonitor(
             folder=folder, stable_secs=stable_secs,
@@ -1235,7 +1610,8 @@ class JobWatcher:
         jid = self.job_id
         def _on_sf_stable(sf_path, files):
             self._batched_paths.add(sf_path)
-            self._on_batch_ready(files, jid, Path(sf_path).name)
+            # Pass full sf_path so batch handler can compute arcnames for structured zips
+            self._on_batch_ready(files, jid, sf_path)
         self._subfolder_monitor = SubfolderBatchMonitor(
             folder=folder, stable_secs=stable_secs,
             on_subfolder_stable=_on_sf_stable,
@@ -1243,10 +1619,36 @@ class JobWatcher:
             skip_subfolders=set(self._batched_paths),
             extensions=extensions, ignore_hidden=ignore_hidden)
         self._subfolder_monitor.start()
+        self._start_root_file_monitor(folder)
+
+    def _start_root_file_monitor(self, folder: str):
+        if self._root_file_monitor:
+            self._root_file_monitor.stop()
+        stable_secs   = int(self._job.get("watch_batch_stable_secs", 15))
+        extensions    = set(self._job.get("watch_extensions") or []) or None
+        ignore_hidden = bool(self._job.get("watch_ignore_hidden", True))
+        jid = self.job_id
+        def _root_status(msg, color):
+            # Don't override subfolder monitor's status with idle green messages
+            if color != "green":
+                self._on_status(msg, color, jid)
+        self._root_file_monitor = FolderBatchMonitor(
+            folder=folder, stable_secs=stable_secs,
+            on_stable=lambda files: self._on_batch_ready(files, jid, ""),
+            on_status=_root_status,
+            skip_paths=set(self._batched_paths),
+            extensions=extensions, recursive=False,
+            ignore_hidden=ignore_hidden)
+        self._root_file_monitor.start()
 
     def add_batched_paths(self, paths: list):
         self._batched_paths.update(paths)
         if self._subfolder_monitor:
+            # Restart root file monitor if it has fired (thread exited); skip set is now updated
+            if self._root_file_monitor and not self._root_file_monitor._thread.is_alive():
+                folder = self._job.get("watch_folder", "")
+                if folder and Path(folder).is_dir():
+                    self._start_root_file_monitor(folder)
             return  # SubfolderBatchMonitor is continuous; manages its own skip set
         folder = self._job.get("watch_folder", "")
         if folder and Path(folder).is_dir():
@@ -1476,6 +1878,7 @@ class TitleBar(QFrame):
         self._status_lbl.setStyleSheet(f"color: {_th_graphite()};")
         lay.addWidget(self._status_lbl)
 
+        lay.addSpacing(12)
         lay.addWidget(VDivider(), 0)
         lay.addSpacing(12)
 
@@ -1497,9 +1900,13 @@ class TitleBar(QFrame):
 
 class FileRow(QFrame):
     def __init__(self, parent, entry: UploadEntry,
-                 cancel_cb, resume_cb, retry_cb=None):
+                 cancel_cb, resume_cb, retry_cb=None, email_after_cb=None,
+                 email_after_active_fn=None):
         super().__init__(parent)
         self._entry_id   = entry.id
+        self._email_after_cb = email_after_cb
+        self._email_after_active_fn = email_after_active_fn
+        self._email_after_on = False
         self._file_size  = entry.file_size
         self._bytes_disp = entry.resumable_progress
         self._bytes_conf = entry.resumable_progress
@@ -1585,6 +1992,30 @@ class FileRow(QFrame):
             self.set_failed(entry.error or "Unknown error")
         else:
             self._rebuild_ctrl("queued")
+
+    def contextMenuEvent(self, event):
+        if not self._email_after_cb:
+            return
+        if self._email_after_active_fn and not self._email_after_active_fn():
+            return
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        act = menu.addAction("Send client email after this file uploads")
+        chosen = menu.exec(event.globalPos())
+        if chosen == act:
+            self._email_after_cb(self._entry_id)
+
+    def mark_email_after(self, on: bool = True):
+        self._email_after_on = on
+        base = self._name_lbl.toolTip()
+        if base.startswith("✉"):
+            base = base.split("\n", 1)[-1]
+        if on:
+            self._name_lbl.setToolTip("✉ Email sends after this file\n" + base)
+            self._name_lbl.setStyleSheet(f"color: {TEAL};")
+        else:
+            self._name_lbl.setToolTip(base)
+            self._name_lbl.setStyleSheet(f"color: {_th_ink()};")
 
     def _make_icon_btn(self, text: str, tooltip: str = "") -> QPushButton:
         b = QPushButton(text)
@@ -2721,63 +3152,158 @@ class ComposeEmailDialog(QDialog):
         self._on_send(subject, body)
 
 
+def email_trigger_decision(timing: str, batch_count: int, count_n: int,
+                           pending_exists: bool) -> str:
+    """Pure decision for when a queued email batch should fire.
+    Returns one of: send_batch, arm_quiet, arm_schedule, arm_settle, wait.
+    'auto' is resolved to a concrete timing before this is called."""
+    if timing == "per_file":
+        return "send_batch"
+    if timing in ("finish", "per_subfolder"):
+        return "wait" if pending_exists else "send_batch"
+    if timing == "drop_finished":
+        return "wait" if pending_exists else "arm_settle"
+    if timing == "count":
+        if count_n <= 0:
+            return "send_batch"
+        return "send_batch" if batch_count >= count_n else "wait"
+    if timing == "quiet":
+        return "arm_quiet"
+    if timing == "schedule":
+        return "arm_schedule"
+    if timing == "after_queue_file":
+        return "wait"  # sentinel in _email_on_file_done handles the actual send
+    return "wait"
+
+
+def make_styled_combo(combo=None):
+    from PyQt6.QtWidgets import QComboBox, QListView
+    c = combo if combo is not None else QComboBox()
+    c.setFont(F_BODY(11))
+    c.setMaxVisibleItems(10)
+    lv = QListView(c)
+    lv.setMouseTracking(True)
+    c.setView(lv)
+    c.setStyleSheet(
+        f"QComboBox {{ background: {_th_surface()}; color: {_th_ink()};"
+        f" border: 1px solid {TEAL_PALE}; border-radius: 6px;"
+        f" padding: 4px 10px; min-height: 24px; }}"
+        f"QComboBox:hover {{ border: 1px solid {TEAL}; }}"
+        f"QComboBox::drop-down {{ border: none; width: 18px; }}"
+        f"QComboBox QAbstractItemView {{ background: {_th_surface()}; color: {_th_ink()};"
+        f" border: 1px solid {TEAL_PALE}; border-radius: 8px;"
+        f" padding: 4px; outline: 0;"
+        f" selection-background-color: transparent; }}"
+        f"QComboBox QAbstractItemView::item {{ min-height: 26px; padding: 6px 10px;"
+        f" border-radius: 5px; }}"
+        f"QComboBox QAbstractItemView::item:hover {{ background: rgba(0,137,166,0.12);"
+        f" color: {_th_ink()}; }}"
+        f"QComboBox QAbstractItemView::item:selected {{ background: rgba(0,137,166,0.20);"
+        f" color: {_th_ink()}; }}"
+    )
+    return c
+
+
 class EmailDraftDialog(QDialog):
     """Capture email To/CC/BCC/Subject/Body at job-creation time (no send)."""
     DEFAULT_SUBJECT = EmailTemplateDialog.DEFAULT_SUBJECT
     DEFAULT_BODY    = EmailTemplateDialog.DEFAULT_BODY
+    STARTER_TEMPLATES = [
+        {"name": "⭐ Folder link (many files)",
+         "subject": "Your files are ready",
+         "body": "Hi,\n\nYour {count} files are ready here:\n{folder_link}\n\nBest,\n{sender_name}"},
+        {"name": "⭐ Single file / zip",
+         "subject": "Your file is ready: {filename}",
+         "body": "Hi,\n\nYour file is ready to download:\n{link}\n\nBest,\n{sender_name}"},
+        {"name": "⭐ Summary list",
+         "subject": "Your {count} files are ready",
+         "body": "Hi,\n\nHere are your {count} files:\n\n{file_list}\n\nBest,\n{sender_name}"},
+        {"name": "⭐ Per subfolder",
+         "subject": "{folder_name} is ready",
+         "body": "Hi,\n\nThe folder \"{folder_name}\" is ready:\n{folder_link}\n\nBest,\n{sender_name}"},
+    ]
+    BODY_STARTERS = [
+        {"name": "⭐ Folder link (many files)",
+         "subject": "Your files are ready",
+         "body": "Hi,\n\nYour {count} files are ready here:\n{folder_link}\n\nBest,\n{sender_name}"},
+        {"name": "⭐ Single file / zip",
+         "subject": "Your file is ready: {filename}",
+         "body": "Hi,\n\nYour file is ready to download:\n{link}\n\nBest,\n{sender_name}"},
+        {"name": "⭐ Summary list",
+         "subject": "Your {count} files are ready",
+         "body": "Hi,\n\nHere are your {count} files:\n\n{file_list}\n\nBest,\n{sender_name}"},
+        {"name": "⭐ Per subfolder",
+         "subject": "{folder_name} is ready",
+         "body": "Hi,\n\nThe folder \"{folder_name}\" is ready:\n{folder_link}\n\nBest,\n{sender_name}"},
+    ]
+    TIMING_STARTERS = [
+        {"name": "Watch folder default", "timing": "auto",
+         "quiet_minutes": 5, "count_n": 25, "schedule_minutes": 60, "settle_secs": 60, "scope": "combined"},
+        {"name": "Drop finishes", "timing": "drop_finished",
+         "quiet_minutes": 5, "count_n": 25, "schedule_minutes": 60, "settle_secs": 60, "scope": "combined"},
+        {"name": "Every 25 files", "timing": "count",
+         "quiet_minutes": 5, "count_n": 25, "schedule_minutes": 60, "settle_secs": 60, "scope": "combined"},
+        {"name": "Per subfolder", "timing": "per_subfolder",
+         "quiet_minutes": 5, "count_n": 25, "schedule_minutes": 60, "settle_secs": 60, "scope": "combined"},
+        {"name": "Manual summary", "timing": "finish",
+         "quiet_minutes": 5, "count_n": 25, "schedule_minutes": 60, "settle_secs": 60, "scope": "combined"},
+    ]
 
-    def __init__(self, parent, draft: dict | None = None, cfg: dict | None = None):
+    def __init__(self, parent, draft: dict | None = None, cfg: dict | None = None,
+                 mode: str = "manual"):
         super().__init__(parent)
         self.setWindowTitle("Email Settings")
-        self.resize(500, 480)
+        self.resize(520, 700)
         self.setModal(True)
         d = draft or {}
         self._cfg = cfg
+        self._mode = mode
         self.result_draft: dict | None = None
+        if cfg is not None:
+            self._migrate_legacy_templates()
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
 
         title = QLabel("Email Settings")
         title.setFont(F_SEMIBOLD(15))
         lay.addWidget(title)
 
-        # ── Template bar ──────────────────────────────────────────────────────
+        # ── Three independent preset bars ─────────────────────────────────────
         if cfg is not None:
-            tmpl_bar = QWidget(); tmpl_bar.setStyleSheet("background: transparent;")
-            tb_lay = QHBoxLayout(tmpl_bar)
-            tb_lay.setContentsMargins(0, 0, 0, 0); tb_lay.setSpacing(6)
-            tmpl_lbl = QLabel("Template:")
-            tmpl_lbl.setFont(F_LABEL(10))
-            tmpl_lbl.setStyleSheet(f"color: {_th_stone()};")
-            tb_lay.addWidget(tmpl_lbl)
-            self._tmpl_combo = QComboBox()
-            self._tmpl_combo.setFont(F_BODY(11))
-            self._refresh_tmpl_combo()
-            tb_lay.addWidget(self._tmpl_combo, 1)
-            load_btn = QPushButton("Load")
-            load_btn.setObjectName("ghost"); load_btn.setFixedHeight(24)
-            load_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            load_btn.clicked.connect(self._load_template)
-            tb_lay.addWidget(load_btn)
-            save_tmpl_btn = QPushButton("Save as Template…")
-            save_tmpl_btn.setObjectName("ghost"); save_tmpl_btn.setFixedHeight(24)
-            save_tmpl_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            save_tmpl_btn.clicked.connect(self._save_as_template)
-            tb_lay.addWidget(save_tmpl_btn)
-            del_tmpl_btn = QPushButton("Delete")
-            del_tmpl_btn.setObjectName("ghost")
-            del_tmpl_btn.setFixedHeight(24)
-            del_tmpl_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            del_tmpl_btn.clicked.connect(self._delete_template)
-            tb_lay.addWidget(del_tmpl_btn)
-            lay.addWidget(tmpl_bar)
-        else:
-            self._tmpl_combo = None
+            self._body_combo = self._styled_combo()
+            self._refresh_body_combo()
+            self._body_combo.currentIndexChanged.connect(self._on_body_combo_changed)
+            self._add_preset_bar(lay, "Body template:", self._body_combo,
+                                 self._save_body_template,
+                                 self._rename_body_template,
+                                 self._delete_body_template)
 
-        hint = QLabel("{link} and {filename} are replaced when the email is sent.")
+            self._recip_combo = self._styled_combo()
+            self._refresh_recip_combo()
+            self._recip_combo.currentIndexChanged.connect(self._on_recip_combo_changed)
+            self._add_preset_bar(lay, "Recipient preset:", self._recip_combo,
+                                 self._save_recip_preset,
+                                 self._rename_recip_preset,
+                                 self._delete_recip_preset)
+
+            self._tpreset_combo = self._styled_combo()
+            self._refresh_tpreset_combo()
+            self._tpreset_combo.currentIndexChanged.connect(self._on_tpreset_combo_changed)
+            self._add_preset_bar(lay, "Timing preset:", self._tpreset_combo,
+                                 self._save_timing_preset,
+                                 self._rename_timing_preset,
+                                 self._delete_timing_preset)
+        else:
+            self._body_combo = None
+            self._recip_combo = None
+            self._tpreset_combo = None
+
+        hint = QLabel("Use {link} and {filename} for single files, or {file_list}, "
+                      "{count}, {folder_link} and {folder_name} for summary emails.")
         hint.setFont(F_BODY(11))
+        hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {_th_stone()};")
         lay.addWidget(hint)
 
@@ -2817,7 +3343,10 @@ class EmailDraftDialog(QDialog):
 
         self._body_edit = QPlainTextEdit()
         self._body_edit.setPlainText(d.get("body", self.DEFAULT_BODY))
+        self._body_edit.setMinimumHeight(100)
         lay.addWidget(self._body_edit, 1)
+
+        self._build_timing_section(lay, d)
 
         btn_row = QWidget()
         br_lay = QHBoxLayout(btn_row)
@@ -2837,86 +3366,499 @@ class EmailDraftDialog(QDialog):
         br_lay.addWidget(save_btn)
         lay.addWidget(btn_row)
 
-    def _refresh_tmpl_combo(self):
-        if self._tmpl_combo is None or self._cfg is None:
-            return
-        self._tmpl_combo.blockSignals(True)
-        self._tmpl_combo.clear()
-        self._tmpl_combo.addItem("— load template —")
-        for t in self._cfg.get("email_templates", []):
-            self._tmpl_combo.addItem(t["name"])
-        self._tmpl_combo.blockSignals(False)
+    def _build_timing_section(self, lay, d: dict):
+        from PyQt6.QtWidgets import QComboBox, QSpinBox
+        self._timing_quiet    = int(d.get("quiet_minutes", 5) or 5)
+        self._timing_count    = int(d.get("count_n", 25) or 25)
+        self._timing_schedule = int(d.get("schedule_minutes", 60) or 60)
+        self._timing_settle   = int(d.get("settle_secs", 60) or 60)
 
-    def _load_template(self):
-        if self._tmpl_combo is None or self._cfg is None:
+        sec_lbl = QLabel("When to send")
+        sec_lbl.setFont(F_LABEL(10))
+        sec_lbl.setStyleSheet(f"color: {_th_stone()};")
+        lay.addWidget(sec_lbl)
+
+        self._timing_combo = self._styled_combo()
+        if self._mode == "watch":
+            options = [
+                ("Auto (recommended)", "auto"),
+                ("Once per subfolder", "per_subfolder"),
+                ("When the drop finishes", "drop_finished"),
+                ("Every N files", "count"),
+                ("One email per file", "per_file"),
+                ("After a specific queue file", "after_queue_file"),
+                ("After a quiet period (minutes)", "quiet"),
+                ("On a schedule (minutes)", "schedule"),
+            ]
+        else:
+            options = [
+                ("One email when the upload finishes", "finish"),
+                ("Send email per folder", "per_folder"),
+                ("One email per file", "per_file"),
+                ("After a specific queue file", "after_queue_file"),
+            ]
+        for label_text, value in options:
+            self._timing_combo.addItem(label_text, value)
+        want = d.get("timing") or ("auto" if self._mode == "watch" else "finish")
+        if self._mode == "manual" and want == "finish" and d.get("scope") == "per_folder":
+            want = "per_folder"
+        for i in range(self._timing_combo.count()):
+            if self._timing_combo.itemData(i) == want:
+                self._timing_combo.setCurrentIndex(i)
+                break
+        self._timing_combo.currentIndexChanged.connect(lambda _=0: self._sync_timing_ui())
+        lay.addWidget(self._timing_combo)
+
+        self._timing_num_row = QWidget()
+        nrow = QHBoxLayout(self._timing_num_row)
+        nrow.setContentsMargins(0, 0, 0, 0)
+        nrow.setSpacing(8)
+        self._timing_num_lbl = QLabel("")
+        self._timing_num_lbl.setFont(F_BODY(11))
+        self._timing_num_lbl.setStyleSheet(f"color: {_th_stone()};")
+        nrow.addWidget(self._timing_num_lbl)
+        self._timing_num_spin = QSpinBox()
+        self._timing_num_spin.setRange(1, 9999)
+        nrow.addWidget(self._timing_num_spin)
+        nrow.addStretch()
+        lay.addWidget(self._timing_num_row)
+
+        # Scope (combine vs per-folder) is now chosen directly in the dropdown
+        # via the "Send email per folder" option, so there is no toggle row.
+        self._timing_scope_toggle = None
+        self._timing_scope_row = None
+
+        self._sentinel_hint = QLabel(
+            "Once the job starts and files appear in the queue, right-click "
+            "the specific file and choose “Send client email after this file uploads.”")
+        self._sentinel_hint.setFont(F_BODY(11))
+        self._sentinel_hint.setWordWrap(True)
+        self._sentinel_hint.setStyleSheet(f"color: {_th_stone()};")
+        self._sentinel_hint.setVisible(False)
+        lay.addWidget(self._sentinel_hint)
+
+        self._auto_hint = QLabel(
+            "Auto picks the best timing based on how this job is zipped:\n"
+            "• Zipped per subfolder: one email each time a subfolder finishes.\n"
+            "• One combined zip: one email when the zip finishes uploading.\n"
+            "• No zip: one email once the drop stops arriving (no new files).")
+        self._auto_hint.setFont(F_BODY(11))
+        self._auto_hint.setWordWrap(True)
+        self._auto_hint.setStyleSheet(f"color: {_th_stone()};")
+        self._auto_hint.setVisible(False)
+        lay.addWidget(self._auto_hint)
+
+        self._sync_timing_ui()
+
+    def _sync_timing_ui(self):
+        t = self._timing_combo.currentData()
+        labels = {
+            "count":         "Send every N files:",
+            "quiet":         "Minutes of quiet before sending:",
+            "schedule":      "Send every N minutes:",
+            "drop_finished": "Seconds of inactivity before sending:",
+        }
+        defaults = {
+            "count":         self._timing_count,
+            "quiet":         self._timing_quiet,
+            "schedule":      self._timing_schedule,
+            "drop_finished": self._timing_settle,
+        }
+        show_num = t in labels
+        self._timing_num_row.setVisible(show_num)
+        if show_num:
+            self._timing_num_lbl.setText(labels[t])
+            self._timing_num_spin.setValue(int(defaults[t]))
+        if hasattr(self, "_sentinel_hint"):
+            self._sentinel_hint.setVisible(t == "after_queue_file")
+        if hasattr(self, "_auto_hint"):
+            self._auto_hint.setVisible(t == "auto")
+
+    # ── Preset helper widgets ────────────────────────────────────────────────
+
+    def _styled_combo(self):
+        return make_styled_combo()
+
+    def _add_preset_bar(self, lay, label_text: str, combo, save_fn, rename_fn, delete_fn):
+        bar = QWidget(); bar.setStyleSheet("background: transparent;")
+        bl = QVBoxLayout(bar)
+        bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(2)
+        lbl = QLabel(label_text)
+        lbl.setFont(F_LABEL(10))
+        lbl.setStyleSheet(f"color: {_th_stone()};")
+        bl.addWidget(lbl)
+        row = QWidget(); row.setStyleSheet("background: transparent;")
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(4)
+        rl.addWidget(combo, 1)
+        for text, fn in (("Save", save_fn), ("Rename", rename_fn), ("Delete", delete_fn)):
+            btn = QPushButton(text)
+            btn.setObjectName("ghost"); btn.setFixedHeight(24)
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn.clicked.connect(fn)
+            rl.addWidget(btn)
+        bl.addWidget(row)
+        lay.addWidget(bar)
+
+    def _migrate_legacy_templates(self):
+        if self._cfg is None:
             return
-        idx = self._tmpl_combo.currentIndex()
+        if self._cfg.get("_email_preset_migration_done"):
+            return
+        legacy = self._cfg.get("email_templates", [])
+        body_list = self._cfg.setdefault("email_body_templates", [])
+        recip_list = self._cfg.setdefault("email_recipient_presets", [])
+        self._cfg.setdefault("email_timing_presets", [])
+        existing_body  = {t["name"] for t in body_list}
+        existing_recip = {t["name"] for t in recip_list}
+        changed = False
+        for t in legacy:
+            name = t.get("name", "Unnamed")
+            lname = f"Legacy: {name}"
+            if t.get("subject") or t.get("body"):
+                if lname not in existing_body and name not in existing_body:
+                    body_list.append({"name": lname, "subject": t.get("subject", ""),
+                                      "body": t.get("body", "")})
+                    existing_body.add(lname); changed = True
+            if t.get("to") or t.get("cc") or t.get("bcc"):
+                if lname not in existing_recip and name not in existing_recip:
+                    recip_list.append({"name": lname, "to": t.get("to", ""),
+                                       "cc": t.get("cc", ""), "bcc": t.get("bcc", "")})
+                    existing_recip.add(lname); changed = True
+        self._cfg["_email_preset_migration_done"] = True
+        config.save(self._cfg)
+
+    # ── Body template preset ─────────────────────────────────────────────────
+
+    def _refresh_body_combo(self):
+        if self._body_combo is None or self._cfg is None:
+            return
+        self._body_combo.blockSignals(True)
+        self._body_combo.clear()
+        self._body_combo.addItem("— body template —", None)
+        for t in self.BODY_STARTERS:
+            self._body_combo.addItem(t["name"], ("starter", t))
+        for t in self._cfg.get("email_body_templates", []):
+            self._body_combo.addItem(t["name"], ("saved", t))
+        self._body_combo.blockSignals(False)
+
+    def _on_body_combo_changed(self, idx: int):
         if idx == 0:
             return
-        templates = self._cfg.get("email_templates", [])
-        if idx - 1 >= len(templates):
+        data = self._body_combo.itemData(idx)
+        if data is None:
             return
-        t = templates[idx - 1]
-        if t.get("to"):
-            self._to_edit.setText(t["to"])
-        if t.get("cc"):
-            self._cc_edit.setText(t["cc"])
-        if t.get("bcc"):
-            self._bcc_edit.setText(t["bcc"])
+        _, t = data
         self._subj_edit.setText(t.get("subject", ""))
         self._body_edit.setPlainText(t.get("body", ""))
 
-    def _save_as_template(self):
+    def _save_body_template(self):
         if self._cfg is None:
             return
-        name, ok = QInputDialog.getText(self, "Save Template", "Template name:")
+        idx = self._body_combo.currentIndex()
+        data = self._body_combo.itemData(idx) if idx > 0 else None
+        templates = self._cfg.setdefault("email_body_templates", [])
+        if data and data[0] == "saved":
+            t = data[1]
+            t["subject"] = self._subj_edit.text().strip()
+            t["body"] = self._body_edit.toPlainText().rstrip("\n")
+            config.save(self._cfg)
+            self._refresh_body_combo()
+            self._reselect_combo(self._body_combo, "saved", t["name"])
+            return
+        name, ok = QInputDialog.getText(self, "Save Body Template", "Template name:")
         if not ok or not name.strip():
             return
         name = name.strip()
-        t = {
-            "name":    name,
-            "to":      self._to_edit.text().strip(),
-            "cc":      self._cc_edit.text().strip(),
-            "bcc":     self._bcc_edit.text().strip(),
-            "subject": self._subj_edit.text().strip(),
-            "body":    self._body_edit.toPlainText().rstrip("\n"),
-        }
-        templates = self._cfg.setdefault("email_templates", [])
-        for i, existing in enumerate(templates):
-            if existing["name"] == name:
-                templates[i] = t
-                break
+        t = {"name": name, "subject": self._subj_edit.text().strip(),
+             "body": self._body_edit.toPlainText().rstrip("\n")}
+        for i, ex in enumerate(templates):
+            if ex["name"] == name:
+                templates[i] = t; break
         else:
             templates.append(t)
         config.save(self._cfg)
-        self._refresh_tmpl_combo()
-        # Select the just-saved template
-        idx = next((i + 1 for i, tmpl in enumerate(templates) if tmpl["name"] == name), 0)
-        self._tmpl_combo.setCurrentIndex(idx)
+        self._refresh_body_combo()
+        self._reselect_combo(self._body_combo, "saved", name)
 
-    def _delete_template(self):
-        if self._tmpl_combo is None or self._cfg is None:
+    def _rename_body_template(self):
+        if self._cfg is None:
             return
-        idx = self._tmpl_combo.currentIndex()
+        idx = self._body_combo.currentIndex()
         if idx == 0:
-            QMessageBox.information(self, "No Template Selected",
-                                    "Select a template from the dropdown first.")
             return
-        templates = self._cfg.get("email_templates", [])
-        tmpl = templates[idx - 1]
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Delete Template")
-        msg.setText(f'Delete template "{tmpl["name"]}"?')
-        msg.setStandardButtons(
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
-        msg.setDefaultButton(QMessageBox.StandardButton.Cancel)
-        msg.button(QMessageBox.StandardButton.Yes).setText("Delete")
-        if msg.exec() != QMessageBox.StandardButton.Yes:
+        data = self._body_combo.itemData(idx)
+        if not data or data[0] != "saved":
+            QMessageBox.information(self, "Built-in Template", "Built-in templates can't be renamed.")
             return
-        templates.pop(idx - 1)
+        t = data[1]; old = t["name"]
+        name, ok = QInputDialog.getText(self, "Rename Body Template", "New name:", text=old)
+        if not ok or not name.strip() or name.strip() == old:
+            return
+        t["name"] = name.strip()
         config.save(self._cfg)
-        self._refresh_tmpl_combo()
-        self._tmpl_combo.setCurrentIndex(0)
+        self._refresh_body_combo()
+        self._reselect_combo(self._body_combo, "saved", name.strip())
+
+    def _delete_body_template(self):
+        if self._cfg is None:
+            return
+        idx = self._body_combo.currentIndex()
+        if idx == 0:
+            return
+        data = self._body_combo.itemData(idx)
+        if not data or data[0] != "saved":
+            QMessageBox.information(self, "Built-in Template", "Built-in templates can't be deleted.")
+            return
+        t = data[1]
+        if QMessageBox.question(self, "Delete Body Template",
+                                f'Delete "{t["name"]}"?',
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        name_to_del = t["name"]
+        templates = self._cfg.setdefault("email_body_templates", [])
+        templates[:] = [x for x in templates if x.get("name") != name_to_del]
+        config.save(self._cfg)
+        self._refresh_body_combo()
+        self._body_combo.setCurrentIndex(0)
+
+    # ── Recipient preset ──────────────────────────────────────────────────────
+
+    def _refresh_recip_combo(self):
+        if self._recip_combo is None or self._cfg is None:
+            return
+        self._recip_combo.blockSignals(True)
+        self._recip_combo.clear()
+        self._recip_combo.addItem("— recipient preset —", None)
+        for t in self._cfg.get("email_recipient_presets", []):
+            self._recip_combo.addItem(t["name"], ("saved", t))
+        self._recip_combo.blockSignals(False)
+
+    def _on_recip_combo_changed(self, idx: int):
+        if idx == 0:
+            return
+        data = self._recip_combo.itemData(idx)
+        if data is None:
+            return
+        _, t = data
+        self._to_edit.setText(t.get("to", ""))
+        self._cc_edit.setText(t.get("cc", ""))
+        self._bcc_edit.setText(t.get("bcc", ""))
+
+    def _save_recip_preset(self):
+        if self._cfg is None:
+            return
+        idx = self._recip_combo.currentIndex()
+        data = self._recip_combo.itemData(idx) if idx > 0 else None
+        presets = self._cfg.setdefault("email_recipient_presets", [])
+        if data and data[0] == "saved":
+            t = data[1]
+            t["to"] = self._to_edit.text().strip()
+            t["cc"] = self._cc_edit.text().strip()
+            t["bcc"] = self._bcc_edit.text().strip()
+            config.save(self._cfg)
+            self._refresh_recip_combo()
+            self._reselect_combo(self._recip_combo, "saved", t["name"])
+            return
+        name, ok = QInputDialog.getText(self, "Save Recipient Preset", "Preset name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        t = {"name": name, "to": self._to_edit.text().strip(),
+             "cc": self._cc_edit.text().strip(), "bcc": self._bcc_edit.text().strip()}
+        for i, ex in enumerate(presets):
+            if ex["name"] == name:
+                presets[i] = t; break
+        else:
+            presets.append(t)
+        config.save(self._cfg)
+        self._refresh_recip_combo()
+        self._reselect_combo(self._recip_combo, "saved", name)
+
+    def _rename_recip_preset(self):
+        if self._cfg is None:
+            return
+        idx = self._recip_combo.currentIndex()
+        if idx == 0:
+            return
+        data = self._recip_combo.itemData(idx)
+        if not data or data[0] != "saved":
+            return
+        t = data[1]; old = t["name"]
+        name, ok = QInputDialog.getText(self, "Rename Recipient Preset", "New name:", text=old)
+        if not ok or not name.strip() or name.strip() == old:
+            return
+        t["name"] = name.strip()
+        config.save(self._cfg)
+        self._refresh_recip_combo()
+        self._reselect_combo(self._recip_combo, "saved", name.strip())
+
+    def _delete_recip_preset(self):
+        if self._cfg is None:
+            return
+        idx = self._recip_combo.currentIndex()
+        if idx == 0:
+            return
+        data = self._recip_combo.itemData(idx)
+        if not data or data[0] != "saved":
+            return
+        t = data[1]
+        if QMessageBox.question(self, "Delete Recipient Preset",
+                                f'Delete "{t["name"]}"?',
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        name_to_del = t["name"]
+        presets = self._cfg.setdefault("email_recipient_presets", [])
+        presets[:] = [x for x in presets if x.get("name") != name_to_del]
+        config.save(self._cfg)
+        self._refresh_recip_combo()
+        self._recip_combo.setCurrentIndex(0)
+
+    # ── Timing preset ─────────────────────────────────────────────────────────
+
+    # Timings valid in each mode (used to filter built-in starters)
+    _WATCH_TIMINGS  = {"auto", "per_subfolder", "drop_finished", "count",
+                       "per_file", "quiet", "schedule", "after_queue_file"}
+    _MANUAL_TIMINGS = {"finish", "per_file", "count", "after_queue_file"}
+
+    def _timing_preset_key(self) -> str:
+        return ("email_timing_presets_watch" if self._mode == "watch"
+                else "email_timing_presets_manual")
+
+    def _timing_starters_for_mode(self) -> list:
+        valid = self._WATCH_TIMINGS if self._mode == "watch" else self._MANUAL_TIMINGS
+        return [t for t in self.TIMING_STARTERS if t.get("timing") in valid]
+
+    def _refresh_tpreset_combo(self):
+        if self._tpreset_combo is None or self._cfg is None:
+            return
+        self._tpreset_combo.blockSignals(True)
+        self._tpreset_combo.clear()
+        self._tpreset_combo.addItem("— timing preset —", None)
+        for t in self._timing_starters_for_mode():
+            self._tpreset_combo.addItem(t["name"], ("starter", t))
+        for t in self._cfg.get(self._timing_preset_key(), []):
+            self._tpreset_combo.addItem(t["name"], ("saved", t))
+        self._tpreset_combo.blockSignals(False)
+
+    def _on_tpreset_combo_changed(self, idx: int):
+        if idx == 0:
+            return
+        data = self._tpreset_combo.itemData(idx)
+        if data is None:
+            return
+        _, t = data
+        timing = t.get("timing", "auto" if self._mode == "watch" else "finish")
+        found = False
+        for i in range(self._timing_combo.count()):
+            if self._timing_combo.itemData(i) == timing:
+                self._timing_combo.setCurrentIndex(i); found = True; break
+        if not found and self._timing_combo.count() > 0:
+            self._timing_combo.setCurrentIndex(0)
+        self._timing_quiet    = int(t.get("quiet_minutes", 5) or 5)
+        self._timing_count    = int(t.get("count_n", 25) or 25)
+        self._timing_schedule = int(t.get("schedule_minutes", 60) or 60)
+        self._timing_settle   = int(t.get("settle_secs", 60) or 60)
+        self._sync_timing_ui()
+        # If a preset stores scope="per_folder", switch the dropdown to "per_folder"
+        if self._mode == "manual" and t.get("scope") == "per_folder":
+            for i in range(self._timing_combo.count()):
+                if self._timing_combo.itemData(i) == "per_folder":
+                    self._timing_combo.setCurrentIndex(i)
+                    break
+
+    def _save_timing_preset(self):
+        if self._cfg is None:
+            return
+        idx = self._tpreset_combo.currentIndex()
+        data = self._tpreset_combo.itemData(idx) if idx > 0 else None
+        key = self._timing_preset_key()
+        presets = self._cfg.setdefault(key, [])
+        timing = self._timing_combo.currentData()
+        num = self._timing_num_spin.value() if hasattr(self, "_timing_num_spin") else 25
+        if self._mode == "manual" and timing == "per_folder":
+            scope  = "per_folder"
+            timing = "finish"
+        else:
+            scope = "combined"
+        snap = {
+            "timing": timing,
+            "quiet_minutes":    num if timing == "quiet" else self._timing_quiet,
+            "count_n":          num if timing == "count" else self._timing_count,
+            "schedule_minutes": num if timing == "schedule" else self._timing_schedule,
+            "settle_secs":      num if timing == "drop_finished" else self._timing_settle,
+            "scope":            scope,
+        }
+        if data and data[0] == "saved":
+            t = data[1]
+            t.update(snap)
+            config.save(self._cfg)
+            self._refresh_tpreset_combo()
+            self._reselect_combo(self._tpreset_combo, "saved", t["name"])
+            return
+        name, ok = QInputDialog.getText(self, "Save Timing Preset", "Preset name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        t = {"name": name, **snap}
+        for i, ex in enumerate(presets):
+            if ex["name"] == name:
+                presets[i] = t; break
+        else:
+            presets.append(t)
+        config.save(self._cfg)
+        self._refresh_tpreset_combo()
+        self._reselect_combo(self._tpreset_combo, "saved", name)
+
+    def _rename_timing_preset(self):
+        if self._cfg is None:
+            return
+        idx = self._tpreset_combo.currentIndex()
+        if idx == 0:
+            return
+        data = self._tpreset_combo.itemData(idx)
+        if not data or data[0] != "saved":
+            QMessageBox.information(self, "Built-in Preset", "Built-in presets can't be renamed.")
+            return
+        t = data[1]; old = t["name"]
+        name, ok = QInputDialog.getText(self, "Rename Timing Preset", "New name:", text=old)
+        if not ok or not name.strip() or name.strip() == old:
+            return
+        t["name"] = name.strip()
+        config.save(self._cfg)
+        self._refresh_tpreset_combo()
+        self._reselect_combo(self._tpreset_combo, "saved", name.strip())
+
+    def _delete_timing_preset(self):
+        if self._cfg is None:
+            return
+        idx = self._tpreset_combo.currentIndex()
+        if idx == 0:
+            return
+        data = self._tpreset_combo.itemData(idx)
+        if not data or data[0] != "saved":
+            QMessageBox.information(self, "Built-in Preset", "Built-in presets can't be deleted.")
+            return
+        t = data[1]
+        if QMessageBox.question(self, "Delete Timing Preset",
+                                f'Delete "{t["name"]}"?',
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        name_to_del = t["name"]
+        presets = self._cfg.setdefault(self._timing_preset_key(), [])
+        presets[:] = [x for x in presets if x.get("name") != name_to_del]
+        config.save(self._cfg)
+        self._refresh_tpreset_combo()
+        self._tpreset_combo.setCurrentIndex(0)
+
+    def _reselect_combo(self, combo, kind: str, name: str):
+        for i in range(combo.count()):
+            d = combo.itemData(i)
+            if d and d[0] == kind and d[1].get("name") == name:
+                combo.setCurrentIndex(i); return
 
     def _reset(self):
         self._subj_edit.setText(self.DEFAULT_SUBJECT)
@@ -2928,6 +3870,18 @@ class EmailDraftDialog(QDialog):
             self._to_edit.setFocus()
             self._to_edit.setStyleSheet(f"border: 1px solid {RED};")
             return
+        timing = self._timing_combo.currentData()
+        num = self._timing_num_spin.value()
+        quiet_minutes    = num if timing == "quiet"         else self._timing_quiet
+        count_n          = num if timing == "count"         else self._timing_count
+        schedule_minutes = num if timing == "schedule"      else self._timing_schedule
+        settle_secs      = num if timing == "drop_finished" else self._timing_settle
+        # "per_folder" is a UI alias for timing="finish" + scope="per_folder"
+        if self._mode == "manual" and timing == "per_folder":
+            scope  = "per_folder"
+            timing = "finish"
+        else:
+            scope = "combined"
         self.result_draft = {
             "to":      to,
             "cc":      self._cc_edit.text().strip(),
@@ -2936,6 +3890,12 @@ class EmailDraftDialog(QDialog):
             "body":    self._body_edit.toPlainText().rstrip("\n") or self.DEFAULT_BODY,
             "status":  "pending",
             "held":    False,
+            "timing":           timing,
+            "quiet_minutes":    quiet_minutes,
+            "count_n":          count_n,
+            "schedule_minutes": schedule_minutes,
+            "settle_secs":      settle_secs,
+            "scope":            scope,
         }
         self.accept()
 
@@ -3161,6 +4121,27 @@ class JobTile(QFrame):
         self._pause_btn.hide()
         lay.addWidget(self._pause_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        # Job-level badges — apply to the whole job, so live in the header row
+        _hdr_badge_ss = (
+            f"color: {TEAL_DEEP}; background: transparent;"
+            f" border: 1px solid {TEAL_PALE}; border-radius: 4px; padding: 2px 6px;")
+        self._zip_lbl = QLabel("Zip")
+        self._zip_lbl.setFont(F_BODY(11))
+        self._zip_lbl.setStyleSheet(_hdr_badge_ss)
+        self._zip_lbl.setToolTip("Compressed as zip")
+        self._zip_lbl.setVisible(bool(self._job.get("zip")))
+        lay.addWidget(self._zip_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        _ecfg0 = self._job.get("email_cfg")
+        _has_e0 = bool(_ecfg0 and _ecfg0.get("to", "").strip())
+        self._email_badge_lbl = QLabel("Email")
+        self._email_badge_lbl.setFont(F_BODY(11))
+        self._email_badge_lbl.setStyleSheet(_hdr_badge_ss)
+        self._email_badge_lbl.setToolTip(
+            f"Email notification → {_ecfg0.get('to', '') if _ecfg0 else ''}")
+        self._email_badge_lbl.setVisible(_has_e0)
+        lay.addWidget(self._email_badge_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+
         source = self._job.get("source", "manual")
         self._stop_watch_btn = None
         self._remove_btn = None
@@ -3218,17 +4199,6 @@ class JobTile(QFrame):
             self._folder_lbl.setToolTip(full_folder)
         lay.addWidget(self._folder_lbl, 1)
 
-        if self._job.get("zip"):
-            self._zip_lbl = QLabel("Zip")
-            self._zip_lbl.setFont(F_BODY(11))
-            self._zip_lbl.setStyleSheet(
-                f"color: {TEAL_DEEP}; background: transparent;"
-                f" border: 1px solid {TEAL_PALE}; border-radius: 4px; padding: 2px 6px;")
-            self._zip_lbl.setToolTip("Compressed as zip")
-            lay.addWidget(self._zip_lbl)
-        else:
-            self._zip_lbl = None
-
         # For watch jobs, show the destination folder link immediately.
         # For manual jobs, set_folder_drive_id() reveals this after folder creation.
         source = self._job.get("source", "manual")
@@ -3255,19 +4225,6 @@ class JobTile(QFrame):
             self._folder_link_btn.hide()
         lay.addWidget(self._folder_link_btn)
 
-        email_cfg = self._job.get("email_cfg")
-        jid = self._job["id"]
-        self._email_lbl = QPushButton("Edit Email")
-        self._email_lbl.setFont(F_BODY(11))
-        self._email_lbl.setObjectName("ghost")
-        self._email_lbl.setFixedHeight(22)
-        self._email_lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self._email_lbl.clicked.connect(lambda: self._app._edit_job_email(jid))
-        has_email = bool(email_cfg and email_cfg.get("to", "").strip())
-        self._email_lbl.setVisible(has_email)
-        lay.addWidget(self._email_lbl)
-        self._refresh_email_btn_style(email_cfg)
-
         return strip
 
     def set_folder_drive_id(self, drive_id: str, folder_name: str):
@@ -3276,11 +4233,19 @@ class JobTile(QFrame):
         self._folder_link_btn.show()
 
     def _refresh_email_btn_style(self, email_cfg: dict | None):
-        btn = self._email_lbl
         if email_cfg and email_cfg.get("to", "").strip():
-            btn.setToolTip(f"Edit email → {email_cfg.get('to', '')}")
-        else:
-            btn.setToolTip("Add email notification…")
+            self._email_badge_lbl.setToolTip(
+                f"Email notification → {email_cfg.get('to', '')}")
+
+    def refresh_badges(self, job: dict):
+        self._zip_lbl.setVisible(bool(job.get("zip")))
+        ecfg = job.get("email_cfg")
+        has_e = bool(ecfg and ecfg.get("to", "").strip())
+        self._email_badge_lbl.setVisible(has_e)
+        self._email_badge_lbl.setToolTip(
+            f"Email notification → {ecfg.get('to', '') if ecfg else ''}")
+        self._strip.layout().activate()
+        self._strip.updateGeometry()
 
     def _build_watch_status_row(self) -> QWidget:
         row = QWidget()
@@ -3440,11 +4405,19 @@ class JobTile(QFrame):
             hdr = FolderHeaderRow(self._files_widget, group_name, entry.folder_id)
             self._folder_headers[group_id] = hdr
             self._files_lay.addWidget(hdr)
+        _job_ref = self._job
         row = FileRow(self._files_widget, entry,
                       cancel_cb=self._app._cancel_upload,
                       resume_cb=self._app._resume_upload,
-                      retry_cb=self._app._resume_upload)
+                      retry_cb=self._app._resume_upload,
+                      email_after_cb=getattr(self._app, "_set_email_after_entry", None),
+                      email_after_active_fn=lambda: (_job_ref.get("email_cfg") or {}).get("timing") == "after_queue_file")
         self._rows[entry.id] = row
+        if self._job.get("email_after_entry_id") == entry.id:
+            row.mark_email_after(True)
+        elif ((_job_ref.get("email_cfg") or {}).get("timing") == "after_queue_file"
+              and not self._job.get("email_after_entry_id")):
+            row.setToolTip("Right-click to set this file as the email trigger")
         self._files_lay.addWidget(row)
         self._update_header()
         if not self._expanded:
@@ -3466,15 +4439,16 @@ class JobTile(QFrame):
         self._update_header()
 
     def set_email_status(self, status: str, held: bool = False):
-        if not self._email_lbl:
-            return
         color_map = {"sent": GREEN, "failed": RED, "sending": TEAL_MID}
-        c = color_map.get(status, TEAL)
-        label_map = {"sent": "Email Sent", "failed": "Email Failed", "sending": "Sending…"}
-        self._email_lbl.setText(label_map.get(status, "Edit Email"))
-        self._email_lbl.setStyleSheet(
-            f"QPushButton {{ color: {c}; border-color: {c}; }}")
-        self._email_lbl.setToolTip(f"Email {status}")
+        c = color_map.get(status, TEAL_DEEP)
+        label_map = {"sent": "Sent ✓", "failed": "Failed ✗", "sending": "Sending…"}
+        lbl = label_map.get(status, "Email")
+        self._email_badge_lbl.setText(lbl)
+        self._email_badge_lbl.setStyleSheet(
+            f"color: {c}; background: transparent;"
+            f" border: 1px solid {c}; border-radius: 4px; padding: 2px 6px;")
+        self._email_badge_lbl.setToolTip(f"Email {status}")
+        self._email_badge_lbl.setVisible(True)
 
 
 # ── QueuePanel ─────────────────────────────────────────────────────────────────
@@ -3586,6 +4560,7 @@ class QueuePanel(QWidget):
 
 class JobCreationPanel(QFrame):
     job_requested    = pyqtSignal(dict)
+    watch_job_edited = pyqtSignal(str, dict)   # (job_id, spec)
     _folders_ready   = pyqtSignal(list)   # emitted from bg thread → main thread
     _folders_failed  = pyqtSignal(str)    # emitted from bg thread → main thread
 
@@ -3594,6 +4569,7 @@ class JobCreationPanel(QFrame):
         self._cfg  = cfg
         self._app  = app
         self._mode = "upload"
+        self._editing_job_id: str | None = None
         self._pending_files: list[str]   = []
         self._pending_folders: list[str] = []
         self._folder_id   = ""
@@ -3610,7 +4586,7 @@ class JobCreationPanel(QFrame):
 
         self.setStyleSheet(
             f"JobCreationPanel {{ background: {_th_surface_glass()}; border-bottom: 1px solid {_th_mist()}; }}")
-        self.setFixedHeight(280)
+        self.setFixedHeight(420)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(SP_PANEL_H, SP_PANEL_V, SP_PANEL_H, SP_PANEL_V)
@@ -3674,6 +4650,24 @@ class JobCreationPanel(QFrame):
 
         root.addWidget(tab_row)
 
+        # Edit banner — shown only in watch edit mode
+        self._edit_banner = QWidget()
+        self._edit_banner.setStyleSheet(
+            f"background: {_th_teal_wash()}; border: 1px solid {TEAL_MID}; border-radius: 4px;")
+        eb_lay = QHBoxLayout(self._edit_banner)
+        eb_lay.setContentsMargins(8, 4, 8, 4); eb_lay.setSpacing(8)
+        eb_lbl = QLabel("Editing watch job — changes replace the original")
+        eb_lbl.setFont(F_BODY(11))
+        eb_lbl.setStyleSheet(f"color: {_th_graphite()}; background: transparent; border: none;")
+        eb_lay.addWidget(eb_lbl, 1)
+        eb_cancel = QPushButton("Cancel")
+        eb_cancel.setObjectName("ghost"); eb_cancel.setFont(F_BODY(11))
+        eb_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        eb_cancel.clicked.connect(self.cancel_watch_edit)
+        eb_lay.addWidget(eb_cancel)
+        self._edit_banner.hide()
+        root.addWidget(self._edit_banner)
+
         self._stack = QStackedWidget()
         self._stack.setStyleSheet("background: transparent;")
         self._stack.addWidget(self._build_upload_page())
@@ -3691,6 +4685,8 @@ class JobCreationPanel(QFrame):
                 f"QPushButton:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; color: {_th_ink()}; }}")
 
     def _switch_mode(self, mode: str):
+        if mode != "watch" and self._editing_job_id:
+            self.cancel_watch_edit()
         self._mode = mode
         self._upload_tab.setChecked(mode == "upload")
         self._watch_tab.setChecked(mode == "watch")
@@ -3744,6 +4740,10 @@ class JobCreationPanel(QFrame):
             self._acct_combo_u.setStyleSheet(cs)
         if hasattr(self, "_acct_combo_w"):
             self._acct_combo_w.setStyleSheet(cs)
+        if hasattr(self, "_watch_cascade"):
+            self._watch_cascade.refresh_theme()
+        if hasattr(self, "_upload_cascade"):
+            self._upload_cascade.refresh_theme()
 
 
     # ── Upload page ───────────────────────────────────────────────────────────
@@ -3789,6 +4789,14 @@ class JobCreationPanel(QFrame):
         self._file_count_lbl.setFont(F_BODY(11))
         self._file_count_lbl.setStyleSheet(f"color: {_th_graphite()};")
         br_lay.addWidget(self._file_count_lbl)
+        self._clear_sel_btn = QPushButton("Clear")
+        self._clear_sel_btn.setObjectName("ghost")
+        self._clear_sel_btn.setFont(F_BODY(11))
+        self._clear_sel_btn.setFixedHeight(26)
+        self._clear_sel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._clear_sel_btn.clicked.connect(self._clear_selection)
+        self._clear_sel_btn.hide()
+        br_lay.addWidget(self._clear_sel_btn)
         br_lay.addStretch()
         ll.addWidget(browse_row)
 
@@ -3820,20 +4828,48 @@ class JobCreationPanel(QFrame):
 
         rl.addWidget(self._make_dest_row("u"))
         rl.addWidget(self._make_acct_row("u"))
+
+        # Ignore Hidden Files
+        hidden_row_u = QWidget()
+        hidden_row_u.setStyleSheet("background: transparent;")
+        hidden_lay_u = QHBoxLayout(hidden_row_u)
+        hidden_lay_u.setContentsMargins(0, 0, 0, 0)
+        hidden_lay_u.setSpacing(6)
+        self._ignore_hidden_toggle_u = KToggle(on=True)
+        self._ignore_hidden_toggle_u.setToolTip(
+            'Skip files whose names start with "." (e.g. .DS_Store)')
+        hidden_lbl_u = QLabel("Ignore Hidden Files")
+        hidden_lbl_u.setFont(F_BODY(11))
+        hidden_lbl_u.setStyleSheet("background: transparent;")
+        hidden_lbl_u.setToolTip(self._ignore_hidden_toggle_u.toolTip())
+        hidden_lay_u.addWidget(self._ignore_hidden_toggle_u)
+        hidden_lay_u.addWidget(hidden_lbl_u)
+        hidden_lay_u.addStretch()
+        rl.addWidget(hidden_row_u)
+
+        # What happens to your files (flow-logic cascade)
+        a_lbl_u = QLabel("What happens to your files")
+        a_lbl_u.setFont(F_LABEL(10))
+        a_lbl_u.setStyleSheet(f"color: {_th_stone()};")
+        rl.addSpacing(4)
+        rl.addWidget(a_lbl_u)
+
+        self._upload_cascade = UploadCascadeWidget()
+        rl.addWidget(self._upload_cascade)
+
+        rl.addStretch()
+
+        # Delivery
+        delivery_lbl_u = QLabel("Delivery")
+        delivery_lbl_u.setFont(F_LABEL(10))
+        delivery_lbl_u.setStyleSheet(f"color: {_th_stone()};")
+        rl.addWidget(delivery_lbl_u)
+
         rl.addWidget(self._make_toggle_row("u"))
-
-        self._zip_name_row_u = self._make_zip_name_row("u")
-        self._zip_name_row_u.hide()
-        rl.addWidget(self._zip_name_row_u)
-
-        self._keep_zip_row_u = self._make_keep_zip_row("u")
-        self._keep_zip_row_u.hide()
-        rl.addWidget(self._keep_zip_row_u)
 
         self._email_row_u = self._make_email_compose_row("u")
         self._email_row_u.hide()
         rl.addWidget(self._email_row_u)
-        rl.addStretch()
 
         self._add_btn_u = QPushButton("Add to Queue  ▶")
         self._add_btn_u.setObjectName("primary")
@@ -3858,6 +4894,7 @@ class JobCreationPanel(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
 
+        # ── Left: folder picker + filter controls + cascade ───────────────────
         left = QWidget()
         left.setStyleSheet("background: transparent;")
         ll = QVBoxLayout(left)
@@ -3869,113 +4906,57 @@ class JobCreationPanel(QFrame):
         wf_lbl.setStyleSheet(f"color: {_th_stone()};")
         ll.addWidget(wf_lbl)
 
-        wfr = QWidget()
-        wfr.setStyleSheet("background: transparent;")
-        wfr_lay = QHBoxLayout(wfr)
-        wfr_lay.setContentsMargins(0, 0, 0, 0)
-        wfr_lay.setSpacing(6)
+        wfr = QWidget(); wfr.setStyleSheet("background: transparent;")
+        wfr_lay = QHBoxLayout(wfr); wfr_lay.setContentsMargins(0, 0, 0, 0); wfr_lay.setSpacing(6)
         self._watch_path_lbl = QLabel("— not selected —")
         self._watch_path_lbl.setFont(F_MONO(10))
         self._watch_path_lbl.setStyleSheet(f"color: {_th_stone()};")
         wfr_lay.addWidget(self._watch_path_lbl, 1)
         wf_browse = QPushButton("Browse…")
-        wf_browse.setObjectName("ghost")
-        wf_browse.setFont(F_BODY(11))
+        wf_browse.setObjectName("ghost"); wf_browse.setFont(F_BODY(11))
         wf_browse.setFixedHeight(26)
         wf_browse.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         wf_browse.clicked.connect(self._browse_watch_folder)
         wfr_lay.addWidget(wf_browse)
         ll.addWidget(wfr)
 
-        # Advanced params
-        adv_lbl = QLabel("Advanced")
-        adv_lbl.setFont(F_LABEL(10))
-        adv_lbl.setStyleSheet(f"color: {_th_stone()};")
-        ll.addWidget(adv_lbl)
+        ll.addSpacing(4)
 
-        timing_row = QWidget()
-        timing_row.setStyleSheet("background: transparent;")
-        tr_lay = QHBoxLayout(timing_row)
-        tr_lay.setContentsMargins(0, 0, 0, 0)
-        tr_lay.setSpacing(6)
-        stable_lbl = QLabel("Stable:")
-        stable_lbl.setFont(F_BODY(11))
-        stable_lbl.setStyleSheet(f"color: {_th_stone()};")
-        tr_lay.addWidget(stable_lbl)
-        self._watch_stable_spin = QSpinBox()
-        self._watch_stable_spin.setRange(5, 600)
-        self._watch_stable_spin.setValue(15)
-        self._watch_stable_spin.setSuffix(" s")
-        self._watch_stable_spin.setFixedSize(70, 24)
-        self._watch_stable_spin.setFont(F_BODY(11))
-        self._watch_stable_spin.setToolTip(
-            "Stable: how long files must be unchanged before they're\n"
-            "considered done arriving (detects end of a copy/transfer)")
-        stable_lbl.setToolTip(self._watch_stable_spin.toolTip())
-        tr_lay.addWidget(self._watch_stable_spin)
-        tr_lay.addSpacing(10)
-        delay_lbl = QLabel("Delay:")
-        delay_lbl.setFont(F_BODY(11))
-        delay_lbl.setStyleSheet(f"color: {_th_stone()};")
-        tr_lay.addWidget(delay_lbl)
-        self._watch_delay_spin = QSpinBox()
-        self._watch_delay_spin.setRange(0, 300)
-        self._watch_delay_spin.setValue(0)
-        self._watch_delay_spin.setSuffix(" s")
-        self._watch_delay_spin.setFixedSize(70, 24)
-        self._watch_delay_spin.setFont(F_BODY(11))
-        self._watch_delay_spin.setToolTip(
-            "Delay: after files are stable, wait this many extra seconds\n"
-            "before zipping — grace period for metadata writes or late adds")
-        delay_lbl.setToolTip(self._watch_delay_spin.toolTip())
-        tr_lay.addWidget(self._watch_delay_spin)
-        tr_lay.addStretch()
-        ll.addWidget(timing_row)
-
-        ext_row = QWidget()
-        ext_row.setStyleSheet("background: transparent;")
-        er_lay = QHBoxLayout(ext_row)
-        er_lay.setContentsMargins(0, 0, 0, 0)
-        er_lay.setSpacing(6)
-        ext_lbl = QLabel("Types:")
-        ext_lbl.setFont(F_BODY(11))
+        ext_row = QWidget(); ext_row.setStyleSheet("background: transparent;")
+        er_lay = QHBoxLayout(ext_row); er_lay.setContentsMargins(0, 0, 0, 0); er_lay.setSpacing(6)
+        ext_lbl = QLabel("Types:"); ext_lbl.setFont(F_BODY(11))
         ext_lbl.setStyleSheet(f"color: {_th_stone()};")
         er_lay.addWidget(ext_lbl)
         self._watch_exts_edit = QLineEdit()
         self._watch_exts_edit.setPlaceholderText(".mp4 .mov .mxf … (blank = all files)")
-        self._watch_exts_edit.setFont(F_BODY(11))
-        self._watch_exts_edit.setFixedHeight(24)
+        self._watch_exts_edit.setFont(F_BODY(11)); self._watch_exts_edit.setFixedHeight(24)
         er_lay.addWidget(self._watch_exts_edit, 1)
         ll.addWidget(ext_row)
 
-        rec_row = QWidget()
-        rec_row.setStyleSheet("background: transparent;")
-        rec_lay = QHBoxLayout(rec_row)
-        rec_lay.setContentsMargins(0, 0, 0, 0)
-        rec_lay.setSpacing(6)
-        self._watch_recursive_toggle = KToggle(on=False)
-        self._watch_recursive_toggle.setToolTip(
-            "Also watch all subfolders — new files in any nested folder will be picked up")
-        rec_lbl = QLabel("Subfolders")
-        rec_lbl.setFont(F_BODY(11))
-        rec_lbl.setToolTip(self._watch_recursive_toggle.toolTip())
-        rec_lay.addWidget(self._watch_recursive_toggle)
-        rec_lay.addWidget(rec_lbl)
-        rec_lay.addSpacing(16)
+        hidden_row = QWidget(); hidden_row.setStyleSheet("background: transparent;")
+        hr_lay = QHBoxLayout(hidden_row); hr_lay.setContentsMargins(0, 0, 0, 0); hr_lay.setSpacing(6)
         self._watch_ignore_hidden_toggle = KToggle(on=True)
         self._watch_ignore_hidden_toggle.setToolTip(
             'Skip files whose names start with "." (hidden files)')
-        hidden_lbl = QLabel("Ignore Hidden Files")
-        hidden_lbl.setFont(F_BODY(11))
+        hidden_lbl = QLabel("Ignore Hidden Files"); hidden_lbl.setFont(F_BODY(11))
         hidden_lbl.setToolTip(self._watch_ignore_hidden_toggle.toolTip())
-        rec_lay.addWidget(self._watch_ignore_hidden_toggle)
-        rec_lay.addWidget(hidden_lbl)
-        rec_lay.addStretch()
-        ll.addWidget(rec_row)
+        hr_lay.addWidget(self._watch_ignore_hidden_toggle)
+        hr_lay.addWidget(hidden_lbl); hr_lay.addStretch()
+        ll.addWidget(hidden_row)
+
+        a_lbl = QLabel("What happens to your files")
+        a_lbl.setFont(F_LABEL(10))
+        a_lbl.setStyleSheet(f"color: {_th_stone()};")
+        ll.addSpacing(4)
+        ll.addWidget(a_lbl)
+
+        self._watch_cascade = WatchCascadeWidget()
+        ll.addWidget(self._watch_cascade)
 
         ll.addStretch()
         lay.addWidget(left, 2)
 
+        # ── Right: destination + Advanced (zip only) + Delivery ───────────────
         right = QWidget()
         right.setStyleSheet("background: transparent;")
         rl = QVBoxLayout(right)
@@ -3984,29 +4965,75 @@ class JobCreationPanel(QFrame):
 
         rl.addWidget(self._make_dest_row("w"))
         rl.addWidget(self._make_acct_row("w"))
-        rl.addWidget(self._make_toggle_row("w"))
 
-        self._zip_name_row_w = self._make_zip_name_row("w")
-        self._zip_name_row_w.hide()
-        rl.addWidget(self._zip_name_row_w)
+        # Advanced: Stable + Delay — only relevant when zipping
+        self._advanced_lbl_w = QLabel("Advanced")
+        self._advanced_lbl_w.setFont(F_LABEL(10))
+        self._advanced_lbl_w.setStyleSheet(f"color: {_th_stone()};")
+        rl.addSpacing(4)
+        rl.addWidget(self._advanced_lbl_w)
 
-        self._keep_zip_row_w = self._make_keep_zip_row("w")
-        self._keep_zip_row_w.hide()
-        rl.addWidget(self._keep_zip_row_w)
+        self._timing_row_w = QWidget(); self._timing_row_w.setStyleSheet("background: transparent;")
+        tr_lay = QHBoxLayout(self._timing_row_w); tr_lay.setContentsMargins(0, 0, 0, 0); tr_lay.setSpacing(6)
+        stable_lbl = QLabel("Stable:"); stable_lbl.setFont(F_BODY(11))
+        stable_lbl.setStyleSheet(f"color: {_th_stone()};")
+        tr_lay.addWidget(stable_lbl)
+        self._watch_stable_spin = QSpinBox()
+        self._watch_stable_spin.setRange(5, 600); self._watch_stable_spin.setValue(15)
+        self._watch_stable_spin.setSuffix(" s"); self._watch_stable_spin.setFixedSize(70, 24)
+        self._watch_stable_spin.setFont(F_BODY(11))
+        self._watch_stable_spin.setToolTip(
+            "Stable: how long files must be unchanged before they're\n"
+            "considered done arriving (detects end of a copy/transfer)")
+        stable_lbl.setToolTip(self._watch_stable_spin.toolTip())
+        tr_lay.addWidget(self._watch_stable_spin)
+        tr_lay.addSpacing(10)
+        delay_lbl = QLabel("Delay:"); delay_lbl.setFont(F_BODY(11))
+        delay_lbl.setStyleSheet(f"color: {_th_stone()};")
+        tr_lay.addWidget(delay_lbl)
+        self._watch_delay_spin = QSpinBox()
+        self._watch_delay_spin.setRange(0, 300); self._watch_delay_spin.setValue(0)
+        self._watch_delay_spin.setSuffix(" s"); self._watch_delay_spin.setFixedSize(70, 24)
+        self._watch_delay_spin.setFont(F_BODY(11))
+        self._watch_delay_spin.setToolTip(
+            "Delay: after files are stable, wait this many extra seconds\n"
+            "before zipping — grace period for metadata writes or late adds")
+        delay_lbl.setToolTip(self._watch_delay_spin.toolTip())
+        tr_lay.addWidget(self._watch_delay_spin)
+        tr_lay.addStretch()
+        rl.addWidget(self._timing_row_w)
 
-        self._subfolder_zip_row_w = self._make_subfolder_zip_row()
-        self._subfolder_zip_row_w.hide()
-        rl.addWidget(self._subfolder_zip_row_w)
+        # Delivery
+        b_lbl = QLabel("Delivery")
+        b_lbl.setFont(F_LABEL(10))
+        b_lbl.setStyleSheet(f"color: {_th_stone()};")
+        rl.addSpacing(4)
+        rl.addWidget(b_lbl)
+
+        delivery_row = QWidget(); delivery_row.setStyleSheet("background: transparent;")
+        dr = QHBoxLayout(delivery_row); dr.setContentsMargins(0, 0, 0, 0); dr.setSpacing(6)
+        self._email_toggle_w = KToggle(on=False)
+        email_lbl = QLabel("Email"); email_lbl.setFont(F_BODY(11))
+        self._share_toggle_w = KToggle(on=False)
+        share_lbl = QLabel("Public Link"); share_lbl.setFont(F_BODY(11))
+        _share_tip = 'After upload, sets sharing to "Anyone with the link" → Viewer'
+        share_lbl.setToolTip(_share_tip); self._share_toggle_w.setToolTip(_share_tip)
+        dr.addWidget(self._email_toggle_w); dr.addWidget(email_lbl)
+        dr.addSpacing(10)
+        dr.addWidget(self._share_toggle_w); dr.addWidget(share_lbl)
+        dr.addStretch()
+        rl.addWidget(delivery_row)
+        self._email_toggle_w.toggled.connect(self._on_email_toggle_w)
 
         self._email_row_w = self._make_email_compose_row("w")
         self._email_row_w.hide()
         rl.addWidget(self._email_row_w)
+
         rl.addStretch()
 
         self._add_btn_w = QPushButton("Start Watching  ▶")
         self._add_btn_w.setObjectName("primary")
-        self._add_btn_w.setFont(F_SEMIBOLD(12))
-        self._add_btn_w.setFixedHeight(32)
+        self._add_btn_w.setFont(F_SEMIBOLD(12)); self._add_btn_w.setFixedHeight(32)
         self._add_btn_w.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._add_btn_w.setStyleSheet(
             f"QPushButton {{ background: {TEAL}; color: white; border: none; border-radius: 4px; }}"
@@ -4015,6 +5042,11 @@ class JobCreationPanel(QFrame):
         self._add_btn_w.clicked.connect(self._add_watch_job)
         rl.addWidget(self._add_btn_w)
         lay.addWidget(right, 3)
+
+        # Zip toggle → show/hide Advanced section
+        self._watch_cascade._zip_toggle.toggled.connect(self._on_zip_for_advanced)
+        self._on_zip_for_advanced(self._watch_cascade._zip_toggle._on)
+
         return page
 
     # ── Row builders ──────────────────────────────────────────────────────────
@@ -4031,7 +5063,7 @@ class JobCreationPanel(QFrame):
         lbl.setFixedWidth(36)
         lay.addWidget(lbl)
         # Full-width button — shows folder name once picked, placeholder until then
-        dest_btn = QPushButton("📁  Pick Drive folder…")
+        dest_btn = QPushButton("Pick Drive folder…")
         dest_btn.setFont(F_BODY(11))
         dest_btn.setFixedHeight(26)
         dest_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -4075,12 +5107,6 @@ class JobCreationPanel(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
 
-        zip_toggle = KToggle(on=False)
-        zip_lbl = QLabel("Zip")
-        zip_lbl.setFont(F_BODY(11))
-        lay.addWidget(zip_toggle)
-        lay.addWidget(zip_lbl)
-
         email_toggle = KToggle(on=False)
         email_lbl = QLabel("Email")
         email_lbl.setFont(F_BODY(11))
@@ -4097,18 +5123,9 @@ class JobCreationPanel(QFrame):
         lay.addWidget(share_lbl)
         lay.addStretch()
 
-        if which == "u":
-            self._zip_toggle_u   = zip_toggle
-            self._email_toggle_u = email_toggle
-            self._share_toggle_u = share_toggle
-            zip_toggle.toggled.connect(self._on_zip_toggle_u)
-            email_toggle.toggled.connect(self._on_email_toggle_u)
-        else:
-            self._zip_toggle_w   = zip_toggle
-            self._email_toggle_w = email_toggle
-            self._share_toggle_w = share_toggle
-            zip_toggle.toggled.connect(self._on_zip_toggle_w)
-            email_toggle.toggled.connect(self._on_email_toggle_w)
+        self._email_toggle_u = email_toggle
+        self._share_toggle_u = share_toggle
+        email_toggle.toggled.connect(self._on_email_toggle_u)
         return row
 
     def _make_email_compose_row(self, which: str) -> QWidget:
@@ -4125,7 +5142,7 @@ class JobCreationPanel(QFrame):
             self._email_summary_lbl_u = lbl
         else:
             self._email_summary_lbl_w = lbl
-        compose_btn = QPushButton("Compose…")
+        compose_btn = QPushButton("Edit email")
         compose_btn.setObjectName("ghost")
         compose_btn.setFont(F_BODY(11))
         compose_btn.setFixedHeight(24)
@@ -4143,23 +5160,7 @@ class JobCreationPanel(QFrame):
         edit = QLineEdit(); edit.setFont(F_BODY(11)); edit.setFixedHeight(24)
         edit.setPlaceholderText("auto-generated if blank")
         lay.addWidget(edit, 1)
-        if which == "u":
-            self._zip_name_edit_u = edit
-        else:
-            self._zip_name_edit_w = edit
-        return row
-
-    def _make_subfolder_zip_row(self) -> QWidget:
-        row = QWidget(); row.setStyleSheet("background: transparent;")
-        lay = QHBoxLayout(row); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
-        self._subfolder_zip_toggle_w = KToggle(on=False)
-        lbl = QLabel("Zip per subfolder"); lbl.setFont(F_BODY(11))
-        tip = "Zip each new subfolder individually, named after the subfolder"
-        lbl.setToolTip(tip)
-        self._subfolder_zip_toggle_w.setToolTip(tip)
-        lay.addWidget(self._subfolder_zip_toggle_w)
-        lay.addWidget(lbl)
-        lay.addStretch()
+        self._zip_name_edit_u = edit
         return row
 
     def _make_keep_zip_row(self, which: str) -> QWidget:
@@ -4172,10 +5173,7 @@ class JobCreationPanel(QFrame):
         lay.addWidget(toggle)
         lay.addWidget(lbl)
         lay.addStretch()
-        if which == "u":
-            self._keep_zip_toggle_u = toggle
-        else:
-            self._keep_zip_toggle_w = toggle
+        self._keep_zip_toggle_u = toggle
         return row
 
     def _on_zip_toggle_u(self, on: bool):
@@ -4185,15 +5183,6 @@ class JobCreationPanel(QFrame):
             self._zip_name_edit_u.clear()
             self._keep_zip_toggle_u.set(False)
 
-    def _on_zip_toggle_w(self, on: bool):
-        self._zip_name_row_w.setVisible(on)
-        self._keep_zip_row_w.setVisible(on)
-        self._subfolder_zip_row_w.setVisible(on)
-        if not on:
-            self._zip_name_edit_w.clear()
-            self._keep_zip_toggle_w.set(False)
-            self._subfolder_zip_toggle_w.set(False)
-
     def _on_email_toggle_u(self, on: bool):
         self._email_row_u.setVisible(on)
 
@@ -4202,7 +5191,8 @@ class JobCreationPanel(QFrame):
 
     def _compose_email(self, which: str):
         draft = self._email_draft_u if which == "u" else self._email_draft_w
-        dlg = EmailDraftDialog(self, draft, cfg=self._cfg)
+        dlg = EmailDraftDialog(self, draft, cfg=self._cfg,
+                               mode=("manual" if which == "u" else "watch"))
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_draft:
             if which == "u":
                 self._email_draft_u = dlg.result_draft
@@ -4250,9 +5240,11 @@ class JobCreationPanel(QFrame):
         if parts:
             self._file_count_lbl.setText(" + ".join(parts) + " selected")
             self._file_count_lbl.setStyleSheet(f"color: {_th_ink()};")
+            self._clear_sel_btn.show()
         else:
             self._file_count_lbl.setText("No files selected")
             self._file_count_lbl.setStyleSheet(f"color: {_th_graphite()};")
+            self._clear_sel_btn.hide()
 
         # Repopulate scrollable list
         while self._sel_list_lay.count():
@@ -4286,6 +5278,11 @@ class JobCreationPanel(QFrame):
             self._sel_list_lay.addWidget(row)
 
         self._sel_scroll.setVisible(bool(entries))
+
+    def _clear_selection(self):
+        self._pending_files   = []
+        self._pending_folders = []
+        self._update_selection_label()
 
     def _remove_pending(self, path: str, is_folder: bool):
         if is_folder:
@@ -4349,9 +5346,8 @@ class JobCreationPanel(QFrame):
         """Called by App after accounts ready. Loads folders silently in background."""
         if self._available_folders or not acct_id:
             return
-        for btn in (self._dest_lbl_u, self._dest_lbl_w):
-            btn.setText("📁  Loading folders…")
-            btn.setEnabled(False)
+        self._dest_lbl_u.setText("Loading folders…"); self._dest_lbl_u.setEnabled(False)
+        self._dest_lbl_w.setText("Loading folders…"); self._dest_lbl_w.setEnabled(False)
         def _load():
             try:
                 svc     = drive_accounts.get_service(acct_id)
@@ -4363,17 +5359,15 @@ class JobCreationPanel(QFrame):
 
     def _on_folders_ready(self, folders: list):
         self._available_folders = folders
-        for btn in (self._dest_lbl_u, self._dest_lbl_w):
-            btn.setText("📁  Pick Drive folder…")
-            btn.setEnabled(True)
+        self._dest_lbl_u.setText("Pick Drive folder…"); self._dest_lbl_u.setEnabled(True)
+        self._dest_lbl_w.setText("Pick Drive folder…"); self._dest_lbl_w.setEnabled(True)
         if self._folder_load_pending:
             which, self._folder_load_pending = self._folder_load_pending, ""
             self._show_folder_picker(which)
 
     def _on_folders_failed(self, err: str):
-        for btn in (self._dest_lbl_u, self._dest_lbl_w):
-            btn.setText("📁  Pick Drive folder…")
-            btn.setEnabled(True)
+        self._dest_lbl_u.setText("Pick Drive folder…"); self._dest_lbl_u.setEnabled(True)
+        self._dest_lbl_w.setText("Pick Drive folder…"); self._dest_lbl_w.setEnabled(True)
         self._folder_load_pending = ""
         QMessageBox.warning(self, "Drive Error", f"Could not load folders:\n{err}")
 
@@ -4411,7 +5405,7 @@ class JobCreationPanel(QFrame):
             disp = self._folder_name
             if len(disp) > 38:
                 disp = "…" + disp[-36:]
-            dest_btn.setText(f"📁  {disp}")
+            dest_btn.setText(disp)
             dest_btn.setStyleSheet(
                 f"QPushButton {{ background: {_th_teal_wash()}; color: {_th_ink()}; "
                 f"border: 1px solid {TEAL_MID}; border-radius: 4px; text-align: left; padding: 0 8px; }}"
@@ -4433,40 +5427,60 @@ class JobCreationPanel(QFrame):
         if not self._folder_id:
             QMessageBox.warning(self, "No Destination", "Pick a Drive folder first.")
             return
-        acct_id    = self._get_acct_id(self._acct_combo_u)
-        zip_on     = self._zip_toggle_u._on
-        email_cfg  = self._build_email_cfg(self._email_toggle_u, "u")
-        keep_zip   = self._keep_zip_toggle_u._on if zip_on else False
-        share_link = self._share_toggle_u._on
-        custom_zip_name = self._zip_name_edit_u.text().strip() if zip_on else ""
+        acct_id         = self._get_acct_id(self._acct_combo_u)
+        keys            = self._upload_cascade.get_job_keys()
+        zip_on          = keys["zip"]
+        keep_structure  = keys["keep_structure"]
+        keep_zip        = keys["keep_zip"]
+        custom_zip_name = keys["zip_name"]
+        email_cfg       = self._build_email_cfg(self._email_toggle_u, "u")
+        share_link      = self._share_toggle_u._on
+        ignore_hidden   = self._ignore_hidden_toggle_u._on
         base = {
-            "source":           "manual",
-            "drive_account_id": acct_id,
-            "drive_folder_id":  self._folder_id,
+            "source":            "manual",
+            "drive_account_id":  acct_id,
+            "drive_folder_id":   self._folder_id,
             "drive_folder_name": self._folder_name,
-            "email_cfg":        email_cfg,
-            "zip":              zip_on,
-            "keep_zip":         keep_zip,
-            "share_link":       share_link,
+            "email_cfg":         email_cfg,
+            "zip":               zip_on,
+            "keep_zip":          keep_zip,
+            "share_link":        share_link,
+            "ignore_hidden":     ignore_hidden,
+            "keep_structure":    keep_structure,
         }
         ts = datetime.now().strftime("%H:%M")
-        # One job per folder — preserves structure
-        for folder in self._pending_folders:
-            folder_name = Path(folder).name
+        if zip_on:
+            # ONE combined zip: loose files at the zip root +
+            # each selected folder preserved inside the same archive.
+            folders = list(self._pending_folders)
+            loose   = list(self._pending_files)
+            n_items = len(folders) + len(loose)
             spec = {**base,
-                    "name":       f"Upload · {ts} · {folder_name}",
-                    "zip_name":   custom_zip_name or (folder_name if zip_on else ""),
-                    "folder_src": folder,
-                    "files":      []}
-            self.job_requested.emit(spec)
-        # One job for loose files
-        if self._pending_files:
-            n = len(self._pending_files)
-            spec = {**base,
-                    "name":    f"Upload · {ts} · {n} file{'s' if n != 1 else ''}",
+                    "name":     f"Upload · {ts} · {n_items} item{'s' if n_items != 1 else ''} (zip)",
                     "zip_name": custom_zip_name,
-                    "files":    list(self._pending_files)}
+                    "folders":  folders,
+                    "files":    loose}
             self.job_requested.emit(spec)
+        else:
+            # No zip: one structure-preserving job per folder + one loose-files job.
+            for folder in self._pending_folders:
+                folder_name = Path(folder).name
+                spec = {**base,
+                        "name":       f"Upload · {ts} · {folder_name}",
+                        "zip_name":   "",
+                        "folder_src": folder,
+                        "files":      []}
+                self.job_requested.emit(spec)
+            loose = self._pending_files
+            if ignore_hidden:
+                loose = [p for p in loose if not Path(p).name.startswith(".")]
+            if loose:
+                n = len(loose)
+                spec = {**base,
+                        "name":    f"Upload · {ts} · {n} file{'s' if n != 1 else ''}",
+                        "zip_name": "",
+                        "files":    loose}
+                self.job_requested.emit(spec)
         self._pending_files   = []
         self._pending_folders = []
         self._update_selection_label()
@@ -4478,13 +5492,16 @@ class JobCreationPanel(QFrame):
         if not self._folder_id:
             QMessageBox.warning(self, "No Destination", "Pick a Drive folder first.")
             return
-        acct_id    = self._get_acct_id(self._acct_combo_w)
-        zip_on     = self._zip_toggle_w._on
-        email_cfg  = self._build_email_cfg(self._email_toggle_w, "w")
-        share_link = self._share_toggle_w._on
-        raw_exts = self._watch_exts_edit.text().strip()
+        if self._watch_cascade.resolve_action() is None:
+            QMessageBox.warning(self, "Incomplete",
+                                "Choose how to handle your files in step 3 before starting.")
+            return
+        acct_id   = self._get_acct_id(self._acct_combo_w)
+        email_cfg = self._build_email_cfg(self._email_toggle_w, "w")
+        raw_exts  = self._watch_exts_edit.text().strip()
         exts = [e.strip() if e.strip().startswith(".") else f".{e.strip()}"
                 for e in raw_exts.split() if e.strip()]
+        keys = self._watch_cascade.get_job_keys()
         spec = {
             "name":               f"Watch · {Path(self._watch_path).name}",
             "source":             "watch",
@@ -4493,200 +5510,545 @@ class JobCreationPanel(QFrame):
             "drive_folder_id":    self._folder_id,
             "drive_folder_name":  self._folder_name,
             "email_cfg":          email_cfg,
-            "zip":                zip_on,
-            "zip_name":           self._zip_name_edit_w.text().strip() if zip_on else "",
-            "keep_zip":           self._keep_zip_toggle_w._on if zip_on else False,
+            "zip":                keys["zip"],
+            "zip_name":           keys["zip_name"],
+            "keep_zip":           keys["keep_zip"],
             "watch_stable_secs":  self._watch_stable_spin.value(),
             "watch_delay_secs":   self._watch_delay_spin.value(),
             "watch_extensions":   exts,
-            "watch_recursive":    self._watch_recursive_toggle._on,
-            "watch_ignore_hidden": self._watch_ignore_hidden_toggle._on,
-            "watch_subfolder_zip": zip_on and self._subfolder_zip_toggle_w._on,
-            "share_link":          share_link,
+            "watch_recursive":      keys["watch_recursive"],
+            "watch_ignore_hidden":  self._watch_ignore_hidden_toggle._on,
+            "watch_subfolder_zip":  keys["watch_subfolder_zip"],
+            "watch_root_individual": keys["watch_root_individual"],
+            "watch_keep_structure": keys["watch_keep_structure"],
+            "share_link":           self._share_toggle_w._on,
         }
-        self.job_requested.emit(spec)
-        self._watch_path = ""
-        self._watch_path_lbl.setText("— not selected —")
-        self._watch_path_lbl.setStyleSheet(f"color: {_th_stone()};")
+        if self._editing_job_id:
+            self.watch_job_edited.emit(self._editing_job_id, spec)
+            self._exit_watch_edit_mode(reset=True)
+        else:
+            self.job_requested.emit(spec)
+            self._watch_path = ""
+            self._watch_path_lbl.setText("— not selected —")
+            self._watch_path_lbl.setStyleSheet(f"color: {_th_stone()};")
 
     def refresh_accounts(self):
         self._available_folders = []
         self._populate_accounts(self._acct_combo_u)
         self._populate_accounts(self._acct_combo_w)
 
+    def _on_zip_for_advanced(self, on: bool):
+        self._advanced_lbl_w.setVisible(on)
+        self._timing_row_w.setVisible(on)
 
-# ── WatchEditDialog ────────────────────────────────────────────────────────────
+    def enter_watch_edit_mode(self, job_id: str, job: dict):
+        self._editing_job_id = job_id
+        self._switch_mode("watch")
 
-class WatchEditDialog(QDialog):
-    """Edit watch-folder parameters for an existing queue tile."""
-    _folders_ready = pyqtSignal(list)
+        # Watch folder
+        self._watch_path = job.get("watch_folder", "")
+        if self._watch_path:
+            self._watch_path_lbl.setText(Path(self._watch_path).name)
+            self._watch_path_lbl.setStyleSheet(f"color: {_th_ink()};")
+        else:
+            self._watch_path_lbl.setText("— not selected —")
+            self._watch_path_lbl.setStyleSheet(f"color: {_th_stone()};")
 
-    def __init__(self, job: dict, app, parent=None):
+        # Drive dest
+        self._folder_id   = job.get("drive_folder_id", "")
+        self._folder_name = job.get("drive_folder_name", "")
+        if self._folder_name:
+            disp = self._folder_name
+            if len(disp) > 38:
+                disp = "…" + disp[-36:]
+            self._dest_lbl_w.setText(disp)
+            self._dest_lbl_w.setStyleSheet(
+                f"QPushButton {{ background: {_th_teal_wash()}; color: {_th_ink()}; "
+                f"border: 1px solid {TEAL_MID}; border-radius: 4px; text-align: left; padding: 0 8px; }}"
+                f"QPushButton:hover {{ background: {TEAL_PALE}; border-color: {TEAL}; color: {_th_ink()}; }}")
+
+        # Account
+        acct_id = job.get("drive_account_id", "")
+        if acct_id in self._acct_ids:
+            self._acct_combo_w.setCurrentIndex(self._acct_ids.index(acct_id))
+
+        # Filters
+        self._watch_exts_edit.setText(" ".join(job.get("watch_extensions", [])))
+        self._watch_ignore_hidden_toggle.set(bool(job.get("watch_ignore_hidden", True)))
+
+        # Timing
+        self._watch_stable_spin.setValue(int(job.get("watch_stable_secs", 15)))
+        self._watch_delay_spin.setValue(int(job.get("watch_delay_secs", 0)))
+
+        # Cascade (restores Zip, Subfolders, Keep zip, action chooser)
+        self._watch_cascade.load_from_job(job)
+
+        # Delivery
+        email_cfg = job.get("email_cfg")
+        if email_cfg:
+            self._email_draft_w = email_cfg
+            self._email_toggle_w.set(True)
+        else:
+            self._email_draft_w = None
+            self._email_toggle_w.set(False)
+        self._share_toggle_w.set(bool(job.get("share_link", False)))
+
+        # Manual visibility refresh (KToggle.set does not emit toggled)
+        self._on_zip_for_advanced(self._watch_cascade._zip_toggle._on)
+        self._on_email_toggle_w(self._email_toggle_w._on)
+
+        self._add_btn_w.setText("Save Changes")
+        self._edit_banner.show()
+        self.setFixedHeight(456)
+
+    def _exit_watch_edit_mode(self, reset: bool):
+        self._editing_job_id = None
+        self._edit_banner.hide()
+        self.setFixedHeight(420)
+        self._add_btn_w.setText("Start Watching  ▶")
+        if reset:
+            self._watch_path = ""
+            self._watch_path_lbl.setText("— not selected —")
+            self._watch_path_lbl.setStyleSheet(f"color: {_th_stone()};")
+            self._folder_id = ""
+            self._folder_name = ""
+            self._dest_lbl_w.setText("Pick Drive folder…")
+            self._dest_lbl_w.setStyleSheet(self._dest_btn_style())
+            self._watch_exts_edit.clear()
+            self._watch_cascade.load_from_job({})
+            self._email_toggle_w.set(False)
+            self._email_draft_w = None
+            self._share_toggle_w.set(False)
+            self._on_zip_for_advanced(False)
+            self._on_email_toggle_w(False)
+
+    def cancel_watch_edit(self):
+        self._exit_watch_edit_mode(reset=True)
+
+
+# ── WatchCascadeWidget ─────────────────────────────────────────────────────────
+
+class WatchCascadeWidget(QWidget):
+    """Self-contained cascade: Zip → Subfolders → Action chooser → Result line.
+
+    Call resolve_action() to get the chosen WatchAction (or None if chooser is
+    visible but nothing has been selected yet). Call get_job_keys() to read all
+    four routing keys plus zip_name / keep_zip. Call load_from_job(job) to
+    restore state from a saved job dict.
+    """
+    changed = pyqtSignal()
+
+    _BTN_ZIP_SUB  = (WatchAction.PER_SUBFOLDER_ZIP,
+                     WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT,
+                     WatchAction.SINGLE_ZIP_STRUCTURED,
+                     WatchAction.SINGLE_ZIP_FLAT)
+    _BTN_NZIP_SUB = (WatchAction.UPLOAD_MIRROR,
+                     WatchAction.UPLOAD_FLAT_RECURSIVE)
+
+    _ACTION_LABELS: dict[WatchAction, str] = {
+        WatchAction.PER_SUBFOLDER_ZIP:     "Zip each subfolder separately",
+        WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT: "Zip each subfolder, upload root files individually",
+        WatchAction.SINGLE_ZIP_STRUCTURED: "One zip, keep folder structure",
+        WatchAction.SINGLE_ZIP_FLAT:       "One zip, flatten everything",
+        WatchAction.UPLOAD_MIRROR:         "Upload files, keep folder structure",
+        WatchAction.UPLOAD_FLAT_RECURSIVE: "Upload files, flatten into one folder",
+    }
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._app = app
-        self._job = job
-        self._drive_folder_id   = job.get("drive_folder_id", "")
-        self._drive_folder_name = job.get("drive_folder_name", "")
-        self._watch_folder      = job.get("watch_folder", "")
-        self._available_folders: list = []
-
-        self._folders_ready.connect(self._on_folders_ready)
-
-        self.setWindowTitle("Edit Watch Settings")
-        self.setMinimumWidth(460)
-        self.setStyleSheet(f"QDialog {{ background: {_th_surface()}; }}")
+        self.setStyleSheet("background: transparent;")
+        self._selected_action: WatchAction | None = None
+        self._prev_zip: bool | None = None
+        self._prev_sub: bool | None = None
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 16, 20, 16)
-        lay.setSpacing(10)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
 
-        title = QLabel(f"Watch · {Path(self._watch_folder).name or 'folder'}")
-        title.setFont(F_SEMIBOLD(13))
-        title.setStyleSheet(f"color: {_th_ink()};")
+        # Step 1: Zip toggle
+        zip_row = QWidget(); zip_row.setStyleSheet("background: transparent;")
+        zr = QHBoxLayout(zip_row); zr.setContentsMargins(0, 0, 0, 0); zr.setSpacing(6)
+        self._zip_toggle = KToggle(on=False)
+        zip_lbl = QLabel("Zip"); zip_lbl.setFont(F_BODY(11))
+        zr.addWidget(self._zip_toggle); zr.addWidget(zip_lbl); zr.addStretch()
+        lay.addWidget(zip_row)
+
+        # Indented zip sub-settings
+        self._zip_sub_container = QWidget()
+        self._zip_sub_container.setStyleSheet("background: transparent;")
+        self._zip_sub_container.hide()
+        zsc = QVBoxLayout(self._zip_sub_container)
+        zsc.setContentsMargins(22, 0, 0, 0); zsc.setSpacing(4)
+
+        zn_row = QWidget(); zn_row.setStyleSheet("background: transparent;")
+        znr = QHBoxLayout(zn_row); znr.setContentsMargins(0, 0, 0, 0); znr.setSpacing(6)
+        zn_lbl = QLabel("Zip name:"); zn_lbl.setFont(F_BODY(11))
+        zn_lbl.setStyleSheet(f"color: {_th_stone()};"); zn_lbl.setFixedWidth(66)
+        self._zip_name_edit = QLineEdit()
+        self._zip_name_edit.setFont(F_BODY(11)); self._zip_name_edit.setFixedHeight(24)
+        self._zip_name_edit.setPlaceholderText("auto-generated if blank")
+        znr.addWidget(zn_lbl); znr.addWidget(self._zip_name_edit, 1)
+        zsc.addWidget(zn_row)
+
+        kz_row = QWidget(); kz_row.setStyleSheet("background: transparent;")
+        kzr = QHBoxLayout(kz_row); kzr.setContentsMargins(0, 0, 0, 0); kzr.setSpacing(6)
+        self._keep_zip_toggle = KToggle(on=False)
+        kz_lbl = QLabel("Keep zip after upload"); kz_lbl.setFont(F_BODY(11))
+        kzr.addWidget(self._keep_zip_toggle); kzr.addWidget(kz_lbl); kzr.addStretch()
+        zsc.addWidget(kz_row)
+        lay.addWidget(self._zip_sub_container)
+
+        # Step 2: Subfolders toggle
+        sub_row = QWidget(); sub_row.setStyleSheet("background: transparent;")
+        sr = QHBoxLayout(sub_row); sr.setContentsMargins(0, 0, 0, 0); sr.setSpacing(6)
+        self._subfolders_toggle = KToggle(on=False)
+        sub_lbl = QLabel("Include Subfolders"); sub_lbl.setFont(F_BODY(11))
+        sr.addWidget(self._subfolders_toggle); sr.addWidget(sub_lbl); sr.addStretch()
+        lay.addWidget(sub_row)
+
+        # Step 3: Action chooser
+        self._action_container = QWidget()
+        self._action_container.setStyleSheet("background: transparent;")
+        self._action_container.hide()
+        ac = QVBoxLayout(self._action_container)
+        ac.setContentsMargins(0, 2, 0, 0); ac.setSpacing(4)
+
+        self._loading_combo = False
+        self._action_combo = make_styled_combo()
+        self._action_combo.currentIndexChanged.connect(self._on_action_combo_changed)
+        ac.addWidget(self._action_combo)
+        lay.addWidget(self._action_container)
+
+        # Result line
+        lay.addSpacing(2)
+        self._result_lbl = QLabel("Result: …")
+        self._result_lbl.setFont(F_BODY(11))
+        self._result_lbl.setWordWrap(True)
+        self._result_lbl.setStyleSheet(f"color: {_th_stone()}; background: transparent;")
+        lay.addWidget(self._result_lbl)
+
+        self._zip_toggle.toggled.connect(self.refresh)
+        self._subfolders_toggle.toggled.connect(self.refresh)
+        self.refresh()
+
+    def _populate_action_combo(self, visible):
+        """Fill the dropdown with a placeholder plus the visible option subset,
+        preserving the current selection when it is still valid."""
+        self._loading_combo = True
+        self._action_combo.clear()
+        if visible:
+            self._action_combo.addItem("Choose how to handle your files…", None)
+            for action in visible:
+                self._action_combo.addItem(self._ACTION_LABELS[action], action)
+            target = self._selected_action if self._selected_action in visible else None
+            self._selected_action = target
+            idx = 0
+            if target is not None:
+                for i in range(self._action_combo.count()):
+                    if self._action_combo.itemData(i) == target:
+                        idx = i
+                        break
+            self._action_combo.setCurrentIndex(idx)
+        self._loading_combo = False
+
+    def _on_action_combo_changed(self, _idx=0):
+        if self._loading_combo:
+            return
+        data = self._action_combo.currentData()
+        self._selected_action = data if isinstance(data, WatchAction) else None
+        self._update_result()
+        self.changed.emit()
+
+    def _select_action_in_combo(self, action: WatchAction):
+        self._selected_action = action
+        for i in range(self._action_combo.count()):
+            if self._action_combo.itemData(i) == action:
+                self._loading_combo = True
+                self._action_combo.setCurrentIndex(i)
+                self._loading_combo = False
+                break
+        self._update_result()
+
+    def refresh(self, *_):
+        zip_on = self._zip_toggle._on
+        sub_on = self._subfolders_toggle._on
+
+        # Clear downstream selection when a prerequisite changes
+        if zip_on != self._prev_zip or sub_on != self._prev_sub:
+            self._selected_action = None
+            self._prev_zip = zip_on
+            self._prev_sub = sub_on
+
+        # Zip sub-settings visibility
+        self._zip_sub_container.setVisible(zip_on)
+        if not zip_on:
+            self._zip_name_edit.clear()
+            self._keep_zip_toggle.set(False)
+
+        # Action chooser: show correct button subset
+        if zip_on and sub_on:
+            visible = self._BTN_ZIP_SUB
+        elif not zip_on and sub_on:
+            visible = self._BTN_NZIP_SUB
+        else:
+            visible = ()
+
+        self._populate_action_combo(visible)
+        self._action_container.setVisible(bool(visible))
+
+        self._update_result()
+        self.changed.emit()
+
+    def _update_result(self):
+        action = self.resolve_action()
+        if action is None:
+            self._result_lbl.setText("Result: choose an option to continue.")
+        else:
+            self._result_lbl.setText(f"Result: {WATCH_ACTION_TEXT[action]}")
+
+    def resolve_action(self) -> "WatchAction | None":
+        """Auto-resolves no-chooser cases; returns None if chooser is shown but nothing picked."""
+        zip_on = self._zip_toggle._on
+        sub_on = self._subfolders_toggle._on
+        if not sub_on:
+            return decide_watch_action(zip_=zip_on, subfolders=False,
+                                       keep_structure=False, zip_per_subfolder=False)
+        return self._selected_action  # None until user picks
+
+    def get_job_keys(self) -> dict:
+        """Returns all six routing/packaging keys for saving to a job dict."""
+        action = self.resolve_action()
+        zip_on = self._zip_toggle._on
+        return {
+            "zip":                  zip_on,
+            "zip_name":             self._zip_name_edit.text().strip() if zip_on else "",
+            "keep_zip":             self._keep_zip_toggle._on if zip_on else False,
+            "watch_recursive":      self._subfolders_toggle._on,
+            "watch_subfolder_zip":  action in (WatchAction.PER_SUBFOLDER_ZIP,
+                                               WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT),
+            "watch_root_individual": action == WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT,
+            "watch_keep_structure": action in (WatchAction.SINGLE_ZIP_STRUCTURED,
+                                               WatchAction.UPLOAD_MIRROR),
+        }
+
+    def load_from_job(self, job: dict):
+        """Restore cascade state from a saved job dict. Handles legacy jobs missing keys."""
+        zip_on   = bool(job.get("zip", False))
+        sub_on   = bool(job.get("watch_recursive", False))
+        ks       = bool(job.get("watch_keep_structure", True))
+        zps      = bool(job.get("watch_subfolder_zip", False))
+        zip_name = job.get("zip_name", "")
+        keep_zip = bool(job.get("keep_zip", False))
+
+        self._zip_toggle.set(zip_on)
+        self._subfolders_toggle.set(sub_on)
+        self._zip_name_edit.setText(zip_name)
+        self._keep_zip_toggle.set(keep_zip)
+
+        # Force refresh (null prev so clear-on-change doesn't skip)
+        self._prev_zip = None; self._prev_sub = None
+        self.refresh()  # sets up visibility and clears _selected_action
+
+        # Pre-select the correct action button if a chooser is active
+        if sub_on:
+            action = decide_watch_action(zip_=zip_on, subfolders=True,
+                                        keep_structure=ks, zip_per_subfolder=zps,
+                                        root_individual=bool(job.get("watch_root_individual", False)))
+            self._select_action_in_combo(action)
+
+    def refresh_theme(self):
+        self._result_lbl.setStyleSheet(f"color: {_th_stone()}; background: transparent;")
+        make_styled_combo(self._action_combo)
+
+
+class UploadCascadeWidget(QWidget):
+    """Upload-page flow logic: Keep-folder-structure + Zip -> one of four outcomes.
+
+    Mirrors WatchCascadeWidget in style. Manual selections may contain folders,
+    so subfolders is always True and there is no per-subfolder option; the two
+    toggles fully determine the action via decide_watch_action.
+    """
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        # Step 1: Keep folder structure
+        ks_row = QWidget(); ks_row.setStyleSheet("background: transparent;")
+        ksr = QHBoxLayout(ks_row); ksr.setContentsMargins(0, 0, 0, 0); ksr.setSpacing(6)
+        self._keep_structure_toggle = KToggle(on=True)
+        self._keep_structure_toggle.setToolTip(
+            "Keep your folders and subfolders intact.\n"
+            "Off = everything is flattened into one level.")
+        ks_lbl = QLabel("Keep folder structure"); ks_lbl.setFont(F_BODY(11))
+        ks_lbl.setToolTip(self._keep_structure_toggle.toolTip())
+        ksr.addWidget(self._keep_structure_toggle); ksr.addWidget(ks_lbl); ksr.addStretch()
+        lay.addWidget(ks_row)
+
+        # Step 2: Zip
+        zip_row = QWidget(); zip_row.setStyleSheet("background: transparent;")
+        zr = QHBoxLayout(zip_row); zr.setContentsMargins(0, 0, 0, 0); zr.setSpacing(6)
+        self._zip_toggle = KToggle(on=False)
+        zip_lbl = QLabel("Zip"); zip_lbl.setFont(F_BODY(11))
+        zr.addWidget(self._zip_toggle); zr.addWidget(zip_lbl); zr.addStretch()
+        lay.addWidget(zip_row)
+
+        # Indented zip sub-settings (only while Zip is on)
+        self._zip_sub_container = QWidget()
+        self._zip_sub_container.setStyleSheet("background: transparent;")
+        self._zip_sub_container.hide()
+        zsc = QVBoxLayout(self._zip_sub_container)
+        zsc.setContentsMargins(22, 0, 0, 0); zsc.setSpacing(4)
+
+        zn_row = QWidget(); zn_row.setStyleSheet("background: transparent;")
+        znr = QHBoxLayout(zn_row); znr.setContentsMargins(0, 0, 0, 0); znr.setSpacing(6)
+        zn_lbl = QLabel("Zip name:"); zn_lbl.setFont(F_BODY(11))
+        zn_lbl.setStyleSheet(f"color: {_th_stone()};"); zn_lbl.setFixedWidth(66)
+        self._zip_name_edit = QLineEdit()
+        self._zip_name_edit.setFont(F_BODY(11)); self._zip_name_edit.setFixedHeight(24)
+        self._zip_name_edit.setPlaceholderText("auto-generated if blank")
+        znr.addWidget(zn_lbl); znr.addWidget(self._zip_name_edit, 1)
+        zsc.addWidget(zn_row)
+
+        kz_row = QWidget(); kz_row.setStyleSheet("background: transparent;")
+        kzr = QHBoxLayout(kz_row); kzr.setContentsMargins(0, 0, 0, 0); kzr.setSpacing(6)
+        self._keep_zip_toggle = KToggle(on=False)
+        kz_lbl = QLabel("Keep zip after upload"); kz_lbl.setFont(F_BODY(11))
+        kz_lbl.setToolTip("Keep the zip file locally after uploading (default: delete)")
+        self._keep_zip_toggle.setToolTip(kz_lbl.toolTip())
+        kzr.addWidget(self._keep_zip_toggle); kzr.addWidget(kz_lbl); kzr.addStretch()
+        zsc.addWidget(kz_row)
+        lay.addWidget(self._zip_sub_container)
+
+        # Result line
+        lay.addSpacing(2)
+        self._result_lbl = QLabel("Result: …")
+        self._result_lbl.setFont(F_BODY(11))
+        self._result_lbl.setWordWrap(True)
+        self._result_lbl.setStyleSheet(f"color: {_th_stone()}; background: transparent;")
+        lay.addWidget(self._result_lbl)
+
+        self._keep_structure_toggle.toggled.connect(self.refresh)
+        self._zip_toggle.toggled.connect(self.refresh)
+        self.refresh()
+
+    def refresh(self, *_):
+        zip_on = self._zip_toggle._on
+        self._zip_sub_container.setVisible(zip_on)
+        if not zip_on:
+            self._zip_name_edit.clear()
+            self._keep_zip_toggle.set(False)
+        self._update_result()
+        self.changed.emit()
+
+    def _update_result(self):
+        action = self.resolve_action()
+        self._result_lbl.setText(f"Result: {WATCH_ACTION_TEXT[action]}")
+
+    def resolve_action(self) -> WatchAction:
+        return decide_watch_action(zip_=self._zip_toggle._on, subfolders=True,
+                                   keep_structure=self._keep_structure_toggle._on,
+                                   zip_per_subfolder=False)
+
+    def get_job_keys(self) -> dict:
+        zip_on = self._zip_toggle._on
+        return {
+            "zip":            zip_on,
+            "zip_name":       self._zip_name_edit.text().strip() if zip_on else "",
+            "keep_zip":       self._keep_zip_toggle._on if zip_on else False,
+            "keep_structure": self._keep_structure_toggle._on,
+        }
+
+    def load_from_job(self, job: dict):
+        self._zip_toggle.set(bool(job.get("zip", False)))
+        self._keep_structure_toggle.set(bool(job.get("keep_structure", True)))
+        self._zip_name_edit.setText(job.get("zip_name", ""))
+        self._keep_zip_toggle.set(bool(job.get("keep_zip", False)))
+        self.refresh()
+
+    def refresh_theme(self):
+        self._result_lbl.setStyleSheet(f"color: {_th_stone()}; background: transparent;")
+
+
+# ── Scratch Dirs Dialog ────────────────────────────────────────────────────────
+
+class _ScratchDirsDialog(QDialog):
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self._cfg = cfg
+        self.setWindowTitle("Fallback Storage Folders")
+        self.resize(500, 300)
+        self.setModal(True)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 20)
+        lay.setSpacing(12)
+
+        title = QLabel("Fallback Storage Folders")
+        title.setFont(F_SEMIBOLD(14))
         lay.addWidget(title)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {_th_mist()};"); lay.addWidget(sep)
+        info = QLabel("When zipping runs out of space, Uplift will try these folders in order before auto-detecting other drives.")
+        info.setFont(F_BODY(11))
+        info.setStyleSheet(f"color: {_th_stone()};")
+        info.setWordWrap(True)
+        lay.addWidget(info)
 
-        def lbl_row(label_text, *widgets):
-            r = QWidget(); r.setStyleSheet("background: transparent;")
-            rl = QHBoxLayout(r); rl.setContentsMargins(0,0,0,0); rl.setSpacing(8)
-            lbl = QLabel(label_text); lbl.setFont(F_BODY(11))
-            lbl.setStyleSheet(f"color: {_th_stone()};"); lbl.setFixedWidth(100)
-            rl.addWidget(lbl)
-            for w in widgets: rl.addWidget(w) if not isinstance(w, int) else rl.addStretch()
-            return r
+        self._list = QListWidget()
+        self._list.setFont(F_BODY(11))
+        scratch_dirs = cfg.get("zip_scratch_dirs", [])
+        for d in scratch_dirs:
+            self._list.addItem(d)
+        lay.addWidget(self._list, 1)
 
-        # ── Local watch folder ────────────────────────────────────────────────
-        self._local_lbl = QPushButton(Path(self._watch_folder).name or "Pick folder…")
-        self._local_lbl.setFont(F_BODY(11))
-        self._local_lbl.setFixedHeight(26)
-        self._local_lbl.setStyleSheet(
-            f"QPushButton {{ background: {_th_surface2()}; color: {_th_ink()}; border: 1px solid {TEAL_PALE};"
-            f" border-radius: 4px; text-align: left; padding: 0 8px; }}"
-            f"QPushButton:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; }}")
-        self._local_lbl.clicked.connect(self._pick_local)
-        lay.addWidget(lbl_row("Watch folder:", self._local_lbl))
+        btn_row = QWidget()
+        btn_lay = QHBoxLayout(btn_row)
+        btn_lay.setContentsMargins(0, 0, 0, 0)
+        btn_lay.setSpacing(8)
 
-        # ── Drive destination ─────────────────────────────────────────────────
-        self._drive_btn = QPushButton(self._drive_folder_name or "Pick Drive folder…")
-        self._drive_btn.setFont(F_BODY(11))
-        self._drive_btn.setFixedHeight(26)
-        self._drive_btn.setStyleSheet(
-            f"QPushButton {{ background: {_th_surface2()}; color: {_th_ink()}; border: 1px solid {TEAL_PALE};"
-            f" border-radius: 4px; text-align: left; padding: 0 8px; }}"
-            f"QPushButton:hover {{ background: {_th_teal_wash()}; border-color: {TEAL_MID}; }}")
-        self._drive_btn.clicked.connect(self._pick_drive)
-        lay.addWidget(lbl_row("Drive dest:", self._drive_btn))
+        add_btn = QPushButton("Add folder…")
+        add_btn.setObjectName("ghost")
+        add_btn.setFixedHeight(26)
+        add_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        add_btn.clicked.connect(self._add_folder)
+        btn_lay.addWidget(add_btn)
 
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {_th_mist()};"); lay.addWidget(sep2)
+        rm_btn = QPushButton("Remove")
+        rm_btn.setObjectName("ghost")
+        rm_btn.setFixedHeight(26)
+        rm_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        rm_btn.clicked.connect(self._remove_folder)
+        btn_lay.addWidget(rm_btn)
 
-        # ── Timing params ─────────────────────────────────────────────────────
-        self._stable_spin = QSpinBox()
-        self._stable_spin.setRange(5, 600); self._stable_spin.setSuffix(" s")
-        self._stable_spin.setValue(int(job.get("watch_stable_secs", 15)))
-        self._stable_spin.setToolTip(
-            "How long files must be unchanged before considered done arriving")
-        lay.addWidget(lbl_row("Stable buffer:", self._stable_spin))
-
-        self._delay_spin = QSpinBox()
-        self._delay_spin.setRange(0, 300); self._delay_spin.setSuffix(" s")
-        self._delay_spin.setValue(int(job.get("watch_delay_secs", 0)))
-        self._delay_spin.setToolTip("Extra wait after files are stable before zipping")
-        lay.addWidget(lbl_row("Pre-zip delay:", self._delay_spin))
-
-        self._exts_edit = QLineEdit()
-        self._exts_edit.setFont(F_BODY(11))
-        self._exts_edit.setPlaceholderText(".mp4 .mov .mxf … (blank = all files)")
-        self._exts_edit.setText(" ".join(job.get("watch_extensions", [])))
-        lay.addWidget(lbl_row("File types:", self._exts_edit))
-
-        rec_row = QWidget(); rec_row.setStyleSheet("background: transparent;")
-        rec_lay = QHBoxLayout(rec_row); rec_lay.setContentsMargins(0,0,0,0); rec_lay.setSpacing(8)
-        rec_lbl = QLabel("Subfolders:"); rec_lbl.setFont(F_BODY(11))
-        rec_lbl.setStyleSheet(f"color: {_th_stone()};"); rec_lbl.setFixedWidth(100)
-        self._recursive_toggle = KToggle(on=bool(job.get("watch_recursive", False)))
-        rec_sub = QLabel("Watch all nested subfolders"); rec_sub.setFont(F_BODY(11))
-        rec_lay.addWidget(rec_lbl); rec_lay.addWidget(self._recursive_toggle)
-        rec_lay.addWidget(rec_sub); rec_lay.addStretch()
-        lay.addWidget(rec_row)
-
-        hidden_row = QWidget(); hidden_row.setStyleSheet("background: transparent;")
-        hidden_lay = QHBoxLayout(hidden_row); hidden_lay.setContentsMargins(0,0,0,0); hidden_lay.setSpacing(8)
-        hidden_lbl = QLabel("Hidden files:"); hidden_lbl.setFont(F_BODY(11))
-        hidden_lbl.setStyleSheet(f"color: {_th_stone()};"); hidden_lbl.setFixedWidth(100)
-        self._ignore_hidden_toggle = KToggle(on=bool(job.get("watch_ignore_hidden", True)))
-        hidden_sub = QLabel('Ignore hidden files (starting with ".")'); hidden_sub.setFont(F_BODY(11))
-        hidden_lay.addWidget(hidden_lbl); hidden_lay.addWidget(self._ignore_hidden_toggle)
-        hidden_lay.addWidget(hidden_sub); hidden_lay.addStretch()
-        lay.addWidget(hidden_row)
-
-        lay.addSpacing(6)
-        btn_row = QWidget(); btn_row.setStyleSheet("background: transparent;")
-        br = QHBoxLayout(btn_row); br.setContentsMargins(0,0,0,0); br.setSpacing(8)
-        br.addStretch()
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("ghost"); cancel_btn.setFixedHeight(30)
-        cancel_btn.clicked.connect(self.reject)
-        save_btn = QPushButton("Save & Restart Watch")
-        save_btn.setFixedHeight(30)
-        save_btn.setStyleSheet(
-            f"QPushButton {{ background: {TEAL}; color: white; border: none; border-radius: 4px; }}"
-            f"QPushButton:hover {{ background: {TEAL_DEEP}; }}")
-        save_btn.clicked.connect(self.accept)
-        br.addWidget(cancel_btn); br.addWidget(save_btn)
+        btn_lay.addStretch()
         lay.addWidget(btn_row)
 
-    def _pick_local(self):
-        start = (self._watch_folder
-                 or self._app._cfg.get("last_browse_dir", "")
-                 or str(Path.home()))
-        folder = QFileDialog.getExistingDirectory(self, "Select Watch Folder", start)
-        if folder:
-            self._watch_folder = folder
-            self._app._cfg["last_browse_dir"] = str(Path(folder).parent)
-            self._local_lbl.setText(Path(folder).name)
+        done_btn = QPushButton("Done")
+        done_btn.setObjectName("primary")
+        done_btn.setFixedHeight(32)
+        done_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        done_btn.clicked.connect(self._save_and_close)
+        lay.addWidget(done_btn)
 
-    def _pick_drive(self):
-        self._drive_btn.setText("Loading folders…")
-        self._drive_btn.setEnabled(False)
-        acct_id = self._job.get("drive_account_id", "")
-        def _load():
-            try:
-                if not acct_id:
-                    raise RuntimeError("No account selected.")
-                svc = drive_accounts.get_service(acct_id)
-                folders = drivelib.list_folders(svc)
-                self._folders_ready.emit(folders)
-            except Exception as e:
-                self._folders_ready.emit([])
-        threading.Thread(target=_load, daemon=True).start()
+    def _add_folder(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path = QFileDialog.getExistingDirectory(self, "Select fallback folder")
+        if path:
+            self._list.addItem(path)
 
-    def _on_folders_ready(self, folders: list):
-        self._available_folders = folders
-        self._drive_btn.setText(self._drive_folder_name or "Pick Drive folder…")
-        self._drive_btn.setEnabled(True)
-        dlg = FolderPickerDialog(self, folders)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_id:
-            self._drive_folder_id   = dlg.result_id
-            self._drive_folder_name = dlg.result_name
-            self._drive_btn.setText(dlg.result_name)
+    def _remove_folder(self):
+        for item in self._list.selectedItems():
+            self._list.takeItem(self._list.row(item))
 
-    def result_params(self) -> dict:
-        raw = self._exts_edit.text().strip()
-        exts = [e.strip() if e.strip().startswith(".") else f".{e.strip()}"
-                for e in raw.split() if e.strip()]
-        return {
-            "watch_folder":      self._watch_folder,
-            "drive_folder_id":   self._drive_folder_id,
-            "drive_folder_name": self._drive_folder_name,
-            "watch_stable_secs": self._stable_spin.value(),
-            "watch_delay_secs":  self._delay_spin.value(),
-            "watch_extensions":  exts,
-            "watch_recursive":    self._recursive_toggle._on,
-            "watch_ignore_hidden": self._ignore_hidden_toggle._on,
-        }
+    def _save_and_close(self):
+        dirs = [self._list.item(i).text() for i in range(self._list.count())]
+        self._cfg["zip_scratch_dirs"] = dirs
+        self.accept()
 
 
 # ── SettingsDialog ─────────────────────────────────────────────────────────────
@@ -4737,6 +6099,29 @@ class SettingsDialog(QDialog):
         af_lay.addWidget(manage_btn)
         lay.addWidget(acct_frame)
 
+        # Scratch folders section
+        scratch_frame = QFrame()
+        scratch_frame.setStyleSheet(
+            f"QFrame {{ background: {_th_surface2()}; border-radius: 6px; border: 1px solid {_th_mist()}; }}")
+        sf_lay = QVBoxLayout(scratch_frame)
+        sf_lay.setContentsMargins(14, 10, 14, 10)
+        sf_lay.setSpacing(6)
+        scratch_hdr = QLabel("FALLBACK STORAGE")
+        scratch_hdr.setObjectName("section-header")
+        sf_lay.addWidget(scratch_hdr)
+        scratch_lbl = QLabel("When zipping runs out of space, Uplift automatically tries other drives.")
+        scratch_lbl.setFont(F_BODY(11))
+        scratch_lbl.setStyleSheet(f"color: {_th_stone()}; background: transparent; border: none;")
+        scratch_lbl.setWordWrap(True)
+        sf_lay.addWidget(scratch_lbl)
+        config_btn = QPushButton("Configure fallback folders…")
+        config_btn.setObjectName("ghost")
+        config_btn.setFixedHeight(26)
+        config_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        config_btn.clicked.connect(self._open_scratch_config)
+        sf_lay.addWidget(config_btn)
+        lay.addWidget(scratch_frame)
+
         lay.addStretch()
 
         close_btn = QPushButton("Close")
@@ -4750,8 +6135,44 @@ class SettingsDialog(QDialog):
         self.accept()
         self._app._manage_accounts()
 
+    def _open_scratch_config(self):
+        dlg = _ScratchDirsDialog(self._app._cfg, parent=self)
+        dlg.exec()
+
 
 # ── App ────────────────────────────────────────────────────────────────────────
+
+# ── Menu bar / tray (macOS NSStatusItem via PyObjC) ───────────────────────────
+
+try:
+    from AppKit import (
+        NSObject, NSStatusBar, NSMenu, NSMenuItem, NSImage,
+        NSVariableStatusItemLength, NSApplication as _NSApplication,
+        NSApplicationActivationPolicyRegular as _NSPolicyRegular,
+        NSApplicationActivationPolicyAccessory as _NSPolicyAccessory,
+    )
+    import objc as _objc
+
+    class _TrayTarget(NSObject):
+        """ObjC action target and NSMenuDelegate for the Uplift status-bar item."""
+
+        @_objc.python_method
+        def set_app(self, app):
+            self._uplift_app = app
+
+        def showWindow_(self, sender):
+            self._uplift_app._tray_show_window()
+
+        def realQuit_(self, sender):
+            self._uplift_app._real_quit()
+
+        def menuWillOpen_(self, menu):
+            self._uplift_app._rebuild_ns_menu()
+
+    _HAS_TRAY = True
+except Exception:
+    _HAS_TRAY = False
+
 
 class App(QMainWindow):
     # Thread-safe signals: emitted from bg threads, handled on main thread
@@ -4787,8 +6208,14 @@ class App(QMainWindow):
         self._job_tiles: dict[str, JobTile] = {}
 
         self._watch_watchers: dict[str, JobWatcher] = {}
+        self._watch_drive_caches: dict[str, dict[str, str]] = {}   # job_id -> {local_dir -> drive_id}
+        self._watch_drive_pending: dict[str, dict[str, list]] = {} # job_id -> {local_dir -> [(path, size)]}
+        self._watch_drive_lock = threading.Lock()
+        self._watch_status_text: dict[str, str] = {}               # jid -> last status text (for tray)
         self._email_batch: dict[str, list]           = {}
         self._email_batch_timers: dict[str, QTimer]  = {}
+        self._email_batch_meta: dict[str, dict]      = {}
+        self._is_quitting = False
 
         self._watch_file_signal.connect(self._on_watch_file_ready_main)
         self._watch_batch_signal.connect(self._on_watch_batch_ready_main)
@@ -4796,7 +6223,7 @@ class App(QMainWindow):
 
         self._build_ui()
         self._handle_startup_state()
-        pass  # tray removed
+        self._setup_tray()
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(100)
@@ -4814,6 +6241,7 @@ class App(QMainWindow):
 
         self._creation_panel = JobCreationPanel(self._cfg, app=self)
         self._creation_panel.job_requested.connect(self._on_job_requested)
+        self._creation_panel.watch_job_edited.connect(self._on_watch_job_edited)
         self._creation_panel._settings_btn.clicked.connect(self._open_settings)
         self._creation_panel._log_btn.clicked.connect(self._show_log_viewer)
         root.addWidget(self._creation_panel)
@@ -4863,31 +6291,49 @@ class App(QMainWindow):
             zip_on=zip_on,
         )
 
-        job["zip_name"]   = spec.get("zip_name", "")
-        job["keep_zip"]   = spec.get("keep_zip", False)
-        job["share_link"] = spec.get("share_link", False)
+        job["zip_name"]      = spec.get("zip_name", "")
+        job["keep_zip"]      = spec.get("keep_zip", False)
+        job["share_link"]    = spec.get("share_link", False)
+        job["ignore_hidden"] = spec.get("ignore_hidden", False)
 
         if source == "manual":
-            folder_src = spec.get("folder_src")
-            if folder_src:
-                if zip_on:
-                    self._add_folder_as_zip(folder_src, job)
-                else:
-                    self._add_folder_as_structure(folder_src, job)
+            keep_structure = spec.get("keep_structure", True)
+            ignore_hidden  = job.get("ignore_hidden", False)
+            if zip_on:
+                # ONE combined zip: loose files at the zip root + each folder
+                # preserved (with subfolders when keep_structure is on).
+                entries = self._collect_combo_entries(
+                    spec.get("files", []), spec.get("folders", []),
+                    keep_structure, ignore_hidden)
+                if entries:
+                    self._add_combo_zip(entries, job)
             else:
-                files = spec.get("files", [])
-                if zip_on and files:
-                    self._add_files_as_zip(files, job)
+                folder_src = spec.get("folder_src")
+                if folder_src:
+                    if keep_structure:
+                        self._add_folder_as_structure(folder_src, job)
+                    else:
+                        flat_files = []
+                        for dirpath, dirnames, filenames in os.walk(folder_src):
+                            if ignore_hidden:
+                                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                            for fn in filenames:
+                                if ignore_hidden and fn.startswith("."):
+                                    continue
+                                flat_files.append(os.path.join(dirpath, fn))
+                        self._add_files_for_job(flat_files, job)
                 else:
-                    self._add_files_for_job(files, job)
+                    self._add_files_for_job(spec.get("files", []), job)
         elif source == "watch":
-            job["watch_folder"]        = spec.get("watch_folder", "")
-            job["watch_stable_secs"]   = spec.get("watch_stable_secs", 15)
-            job["watch_delay_secs"]    = spec.get("watch_delay_secs", 0)
-            job["watch_extensions"]    = spec.get("watch_extensions", [])
-            job["watch_recursive"]     = spec.get("watch_recursive", False)
-            job["watch_ignore_hidden"] = spec.get("watch_ignore_hidden", True)
-            job["watch_subfolder_zip"] = spec.get("watch_subfolder_zip", False)
+            job["watch_folder"]          = spec.get("watch_folder", "")
+            job["watch_stable_secs"]     = spec.get("watch_stable_secs", 15)
+            job["watch_delay_secs"]      = spec.get("watch_delay_secs", 0)
+            job["watch_extensions"]      = spec.get("watch_extensions", [])
+            job["watch_recursive"]       = spec.get("watch_recursive", False)
+            job["watch_ignore_hidden"]   = spec.get("watch_ignore_hidden", True)
+            job["watch_subfolder_zip"]   = spec.get("watch_subfolder_zip", False)
+            job["watch_root_individual"] = spec.get("watch_root_individual", False)
+            job["watch_keep_structure"]  = spec.get("watch_keep_structure", True)
             self._start_job_watcher(job)
 
         # Persist after all fields are set (_create_job saves too early).
@@ -4996,6 +6442,66 @@ class App(QMainWindow):
         if added:
             self._start_next_uploads()
 
+    def _collect_combo_entries(self, loose_files: list, folders: list,
+                               keep_structure: bool, ignore_hidden: bool) -> list:
+        """Build (abs_path, arcname) pairs for ONE combined zip.
+
+        Loose files land at the zip root; each folder is preserved relative to
+        its parent when keep_structure is on, otherwise flattened to basenames.
+        Duplicate arcnames get a numeric suffix so nothing is silently dropped.
+        """
+        entries = []
+        used: dict = {}
+        def uniq(arc: str) -> str:
+            if arc not in used:
+                used[arc] = 0
+                return arc
+            used[arc] += 1
+            stem, ext = os.path.splitext(arc)
+            return f"{stem} ({used[arc]}){ext}"
+        for f in loose_files:
+            if ignore_hidden and Path(f).name.startswith("."):
+                continue
+            if os.path.isfile(f):
+                entries.append((f, uniq(Path(f).name)))
+        for folder in folders:
+            base = os.path.dirname(folder.rstrip("/").rstrip("\\"))
+            for dirpath, dirnames, filenames in os.walk(folder):
+                if ignore_hidden:
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for fn in filenames:
+                    if ignore_hidden and fn.startswith("."):
+                        continue
+                    fp = os.path.join(dirpath, fn)
+                    arc = os.path.relpath(fp, base) if keep_structure else Path(fn).name
+                    entries.append((fp, uniq(arc)))
+        return entries
+
+    def _add_combo_zip(self, entries: list, job: dict):
+        job_id      = job["id"]
+        folder_id   = job.get("drive_folder_id", "")
+        folder_name = job.get("drive_folder_name", "")
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        custom   = job.get("zip_name", "").strip()
+        zip_name = (custom if custom.lower().endswith(".zip") else custom + ".zip") if custom else f"upload_{ts}.zip"
+        entry = UploadEntry.new(local_path="", file_size=0,
+                                folder_id=folder_id, folder_name=folder_name,
+                                status="compressing")
+        entry.file_name = zip_name
+        entry.job_id    = job_id
+        self._state.add(entry)
+        tile = self._job_tiles.get(job_id)
+        if tile:
+            tile.add_file(entry)
+        stop_event = threading.Event()
+        worker = ComboZipWorker(entries, zip_name, entry.id, self._state,
+                                self._progress_queue, stop_event=stop_event,
+                                keep_zip=job.get("keep_zip", False),
+                                scratch_dirs=self._cfg.get("zip_scratch_dirs", []))
+        t = threading.Thread(target=worker.run, daemon=True)
+        self._active_zip_workers[entry.id] = (t, stop_event)
+        t.start()
+
     def _add_files_as_zip(self, files: list, job: dict):
         job_id      = job["id"]
         folder_id   = job.get("drive_folder_id", "")
@@ -5015,7 +6521,8 @@ class App(QMainWindow):
         stop_event = threading.Event()
         worker = ListZipWorker(files, zip_name, entry.id, self._state,
                                self._progress_queue, stop_event=stop_event,
-                               keep_zip=job.get("keep_zip", False))
+                               keep_zip=job.get("keep_zip", False),
+                               scratch_dirs=self._cfg.get("zip_scratch_dirs", []))
         t = threading.Thread(target=worker.run, daemon=True)
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
@@ -5039,7 +6546,10 @@ class App(QMainWindow):
         stop_event = threading.Event()
         worker = ZipWorker(folder_path, entry.id, self._state,
                            self._progress_queue, stop_event=stop_event, zip_name=custom,
-                           keep_zip=job.get("keep_zip", False))
+                           keep_zip=job.get("keep_zip", False),
+                           keep_structure=bool(job.get("keep_structure", True)),
+                           ignore_hidden=bool(job.get("ignore_hidden", False)),
+                           scratch_dirs=self._cfg.get("zip_scratch_dirs", []))
         t = threading.Thread(target=worker.run, daemon=True)
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
@@ -5050,12 +6560,39 @@ class App(QMainWindow):
             self._log("_add_folder_as_structure: Drive not connected — aborting")
             self._show_notice("Drive not connected yet. Please wait and try again.")
             return
+        # Quick pre-flight file count (no stat — just walk) for large-folder guard
+        ignore_hidden = bool(job.get("ignore_hidden", False))
+        file_count = 0
+        try:
+            for _dp, dirnames, filenames in os.walk(folder_path):
+                if ignore_hidden:
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for fn in filenames:
+                    if ignore_hidden and fn.startswith("."):
+                        continue
+                    file_count += 1
+                    if file_count > 1500:
+                        break
+                if file_count > 1500:
+                    break
+        except OSError:
+            pass
+        if file_count > 1000:
+            reply = QMessageBox.question(
+                self, "Large Folder",
+                f"This folder contains {file_count:,}+ files.\n\n"
+                "Uploading many individual files can be slow and may stress the app. "
+                "For repositories or large folders, uploading as a zip is more reliable.\n\n"
+                "Continue with individual file upload?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         threading.Thread(target=self._prepare_folder_structure,
                          args=(folder_path, job), daemon=True).start()
 
     def _prepare_folder_structure(self, folder_path: str, job: dict):
-        # job_id hoisted so the except block can reference it even if the
-        # try block fails before assigning it.
+        import traceback as _tb
         job_id = job.get("id", "")
         self._log(f"_prepare_folder_structure started: {folder_path}")
         try:
@@ -5063,45 +6600,43 @@ class App(QMainWindow):
             parent_id      = job.get("drive_folder_id", "")
             parent_display = job.get("drive_folder_name", "")
             job_account    = job.get("drive_account_id", "")
+            share_link     = bool(job.get("share_link", False))
+            ignore_hidden  = bool(job.get("ignore_hidden", False))
+
             if not job_account or not drive_accounts.has_token(job_account):
-                self._progress_queue.put(("file_error", job_id,
+                self._progress_queue.put(("folder_structure_error", job_id,
                                           "No Drive account configured for this job"))
                 return
-            share_link    = bool(job.get("share_link", False))
-            svc = drive_accounts.build_thread_service(job_account)
-            root_drive_id = drivelib.create_drive_folder(svc, folder_name, parent_id)
-            root_display  = f"{parent_display} / {folder_name}"
-            if share_link:
-                try:
-                    drivelib.set_anyone_can_view(svc, root_drive_id)
-                    self._log(f"Public link set on folder: drive.google.com/drive/folders/{root_drive_id}")
-                except Exception as _se:
-                    self._log(f"Public link FAILED on folder: {_se}")
-                    self._progress_queue.put(("share_err", job_id, str(_se), ""))
-            folder_map = {folder_path: root_drive_id}
-            for dirpath, dirnames, _ in os.walk(folder_path):
-                parent_local = str(Path(dirpath).parent)
-                if dirpath != folder_path and parent_local in folder_map:
-                    sub_id = drivelib.create_drive_folder(
-                        svc, Path(dirpath).name, folder_map[parent_local])
-                    folder_map[dirpath] = sub_id
-            # Build relative-path display names for each subfolder.
-            # group_name is relative to folder_path's parent so the root folder
-            # name appears at the top level (e.g. "Powergrade Stills") and
-            # subfolders appear as "Powergrade Stills/CLIP PRESETS".
+
+            # ── Phase 1: detect repository ───────────────────────────────────
+            is_repo = (os.path.exists(os.path.join(folder_path, ".git")) or
+                       os.path.exists(os.path.join(folder_path, ".github")))
+            if is_repo and ignore_hidden:
+                self._log(
+                    f"Repository detected: '{folder_name}'. Ignore Hidden Files is ON — "
+                    ".git, .github, .env and other dotfiles will be skipped. "
+                    "Turn off Ignore Hidden Files or upload as a zip to preserve everything."
+                )
+                self._progress_queue.put(("repo_hidden_warning", job_id, folder_name))
+
+            # ── Phase 2: scan local tree; collect uploadable files ───────────
+            # No Drive API calls yet — we must know which dirs have files before
+            # creating any Drive folders so we never leave empty folders behind.
+            raw_files = []       # list of (filepath, size, dirpath_str)
+            skipped   = []       # list of (filepath, reason)
+            skipped_hidden = 0
             root_parent = str(Path(folder_path).parent)
-            entries = []
-            skipped = []
-            for dirpath, _, filenames in os.walk(folder_path):
-                if not filenames:
+
+            for dirpath, dirnames, filenames in os.walk(folder_path):
+                if ignore_hidden:
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                dir_name = Path(dirpath).name
+                if ignore_hidden and dir_name.startswith(".") and dirpath != folder_path:
                     continue
-                dir_str  = str(dirpath)
-                dir_id   = folder_map.get(dir_str, root_drive_id)
-                try:
-                    rel_name = str(Path(dirpath).relative_to(root_parent))
-                except ValueError:
-                    rel_name = Path(dirpath).name
                 for fn in filenames:
+                    if ignore_hidden and fn.startswith("."):
+                        skipped_hidden += 1
+                        continue
                     fp = os.path.join(dirpath, fn)
                     try:
                         size = os.path.getsize(fp)
@@ -5109,18 +6644,94 @@ class App(QMainWindow):
                         skipped.append((fp, str(_e)))
                         self._log(f"Skipped (unreadable): {fp} — {_e}")
                         continue
-                    entry = UploadEntry.new(fp, size, dir_id, root_display,
-                                            group_id=dir_str,
-                                            group_name=rel_name)
-                    entry.job_id = job_id
-                    entries.append(entry)
+                    raw_files.append((fp, size, dirpath))
 
-            # Signal via the progress queue — the main thread polls this every
-            # 150ms. QTimer.singleShot from a non-Qt background thread is
-            # unreliable (no event loop in the calling thread), so don't use it.
-            self._progress_queue.put(("folder_structure_ready", job_id, entries, list(skipped), root_drive_id, folder_name))
+            if skipped_hidden:
+                self._log(
+                    f"Skipped {skipped_hidden} hidden file(s) in '{folder_name}' "
+                    "(Ignore Hidden Files is ON)"
+                )
+
+            if not raw_files:
+                no_file_msg = f"No uploadable files found in '{folder_name}'"
+                if ignore_hidden and skipped_hidden:
+                    no_file_msg += (
+                        f" ({skipped_hidden} hidden file(s) were skipped — "
+                        "turn off Ignore Hidden Files to include them)"
+                    )
+                self._log(no_file_msg)
+                self._progress_queue.put(("folder_structure_error", job_id, no_file_msg))
+                return
+
+            # ── Phase 3: determine which Drive dirs are needed ───────────────
+            # A dir is needed if it directly contains uploadable files, plus all
+            # of its ancestors up to (but not including) folder_path itself.
+            needed_dirs: set = set()
+            for _, _, dirpath in raw_files:
+                d = dirpath
+                while d != folder_path:
+                    if d in needed_dirs:
+                        break
+                    needed_dirs.add(d)
+                    parent = str(Path(d).parent)
+                    if parent == d:
+                        break
+                    d = parent
+
+            # ── Phase 4: create Drive folders (only needed ones) ─────────────
+            svc = drive_accounts.build_thread_service(job_account)
+            root_drive_id = drivelib.create_drive_folder(svc, folder_name, parent_id)
+            root_display  = f"{parent_display} / {folder_name}"
+            if share_link:
+                try:
+                    drivelib.set_anyone_can_view(svc, root_drive_id)
+                    self._log(
+                        f"Public link set on folder: "
+                        f"drive.google.com/drive/folders/{root_drive_id}"
+                    )
+                except Exception as _se:
+                    self._log(f"Public link FAILED on folder: {_se}")
+                    self._progress_queue.put(("share_err", job_id, str(_se), ""))
+
+            folder_map = {folder_path: root_drive_id}
+            # Walk top-down so parents exist in folder_map before children
+            for dirpath, dirnames, _ in os.walk(folder_path):
+                if ignore_hidden:
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                if dirpath == folder_path:
+                    continue
+                if dirpath not in needed_dirs:
+                    continue
+                parent_local = str(Path(dirpath).parent)
+                if parent_local in folder_map:
+                    try:
+                        sub_id = drivelib.create_drive_folder(
+                            svc, Path(dirpath).name, folder_map[parent_local])
+                        folder_map[dirpath] = sub_id
+                    except Exception as _fe:
+                        self._log(f"Failed to create Drive folder '{dirpath}': {_fe}")
+                        # Fall back to root so files still upload somewhere
+                        folder_map[dirpath] = root_drive_id
+
+            # ── Phase 5: build UploadEntry list ─────────────────────────────
+            entries = []
+            for fp, size, dirpath in raw_files:
+                dir_id = folder_map.get(dirpath, root_drive_id)
+                try:
+                    rel_name = str(Path(dirpath).relative_to(root_parent))
+                except ValueError:
+                    rel_name = Path(dirpath).name
+                entry = UploadEntry.new(fp, size, dir_id, root_display,
+                                        group_id=dirpath,
+                                        group_name=rel_name)
+                entry.job_id = job_id
+                entries.append(entry)
+
+            self._progress_queue.put((
+                "folder_structure_ready", job_id, entries,
+                list(skipped), root_drive_id, folder_name,
+            ))
         except Exception as e:
-            import traceback as _tb
             self._log(f"_prepare_folder_structure ERROR: {e}\n{_tb.format_exc()}")
             self._progress_queue.put(("folder_structure_error", job_id, str(e)))
 
@@ -5134,11 +6745,13 @@ class App(QMainWindow):
             "watch_folder":            job.get("watch_folder", ""),
             "watch_batch_mode":        zip_on,
             "watch_subfolder_zip":     zip_on and bool(job.get("watch_subfolder_zip", False)),
+            "watch_root_individual":   zip_on and bool(job.get("watch_root_individual", False)),
             "watch_batch_stable_secs": job.get("watch_stable_secs", 15),
             "watch_delay_secs":        job.get("watch_delay_secs", 0),
             "watch_extensions":        job.get("watch_extensions", []),
             "watch_recursive":         job.get("watch_recursive", False),
             "watch_ignore_hidden":     job.get("watch_ignore_hidden", True),
+            "watch_keep_structure":    bool(job.get("watch_keep_structure", True)),
         }
 
         def on_file_ready(path, jid):
@@ -5160,6 +6773,9 @@ class App(QMainWindow):
         watcher = self._watch_watchers.pop(job_id, None)
         if watcher:
             watcher.stop()
+        self._watch_drive_caches.pop(job_id, None)
+        self._watch_drive_pending.pop(job_id, None)
+        self._watch_status_text.pop(job_id, None)
 
     def _on_watch_file_ready_main(self, path: str, job_id: str):
         job = self._jobs.get(job_id)
@@ -5169,6 +6785,23 @@ class App(QMainWindow):
             size = os.path.getsize(path)
         except OSError:
             return
+
+        action = decide_watch_action(
+            zip_=bool(job.get("zip", False)),
+            subfolders=bool(job.get("watch_recursive", False)),
+            keep_structure=bool(job.get("watch_keep_structure", True)),
+            zip_per_subfolder=bool(job.get("watch_subfolder_zip", False)),
+        )
+        watch_folder = job.get("watch_folder", "")
+        file_dir     = str(Path(path).parent)
+
+        if action == WatchAction.UPLOAD_MIRROR and file_dir != watch_folder:
+            self._queue_watch_file_with_subfolder(
+                path, size, job_id, file_dir, watch_folder,
+                job["drive_folder_id"], job["drive_folder_name"],
+                job.get("drive_account_id", ""))
+            return
+
         entry = UploadEntry.new(path, size,
                                 job["drive_folder_id"],
                                 job["drive_folder_name"])
@@ -5180,7 +6813,67 @@ class App(QMainWindow):
                 tile.add_file(entry)
             self._start_next_uploads()
 
+    def _queue_watch_file_with_subfolder(self, path: str, size: int, job_id: str,
+                                          file_dir: str, watch_folder: str,
+                                          root_drive_id: str, root_drive_name: str,
+                                          account_id: str):
+        with self._watch_drive_lock:
+            cache   = self._watch_drive_caches.setdefault(job_id, {})
+            pending = self._watch_drive_pending.setdefault(job_id, {})
+            if file_dir in cache:
+                drive_id = cache[file_dir]
+                try:
+                    rel = str(Path(file_dir).relative_to(watch_folder))
+                except ValueError:
+                    rel = Path(file_dir).name
+                self._progress_queue.put(("watch_subfolder_file_ready", job_id,
+                                          path, size, drive_id,
+                                          f"{root_drive_name} / {rel}", file_dir))
+                return
+            if file_dir in pending:
+                pending[file_dir].append((path, size))
+                return
+            pending[file_dir] = [(path, size)]
+        threading.Thread(
+            target=self._create_watch_subfolder_and_flush,
+            args=(job_id, file_dir, watch_folder,
+                  root_drive_id, root_drive_name, account_id),
+            daemon=True).start()
+
+    def _create_watch_subfolder_and_flush(self, job_id: str, file_dir: str,
+                                           watch_folder: str, root_drive_id: str,
+                                           root_drive_name: str, account_id: str):
+        drive_id    = root_drive_id
+        folder_name = root_drive_name
+        try:
+            rel = Path(file_dir).relative_to(watch_folder)
+            svc = drive_accounts.build_thread_service(account_id)
+            parent_id    = root_drive_id
+            current_local = watch_folder
+            for part in rel.parts:
+                current_local = str(Path(current_local) / part)
+                with self._watch_drive_lock:
+                    cache = self._watch_drive_caches.setdefault(job_id, {})
+                    if current_local in cache:
+                        parent_id = cache[current_local]
+                        continue
+                new_id = drivelib.create_drive_folder(svc, part, parent_id)
+                parent_id = new_id
+                with self._watch_drive_lock:
+                    self._watch_drive_caches.setdefault(job_id, {})[current_local] = new_id
+            drive_id    = parent_id
+            folder_name = f"{root_drive_name} / {rel}"
+        except Exception as e:
+            self._log(f"watch subfolder create error: {e}")
+        with self._watch_drive_lock:
+            pending = self._watch_drive_pending.get(job_id, {})
+            files   = pending.pop(file_dir, [])
+        for p_path, p_size in files:
+            self._progress_queue.put(("watch_subfolder_file_ready", job_id,
+                                      p_path, p_size, drive_id, folder_name, file_dir))
+
     def _on_watch_status_main(self, msg: str, color: str, jid: str):
+        self._watch_status_text[jid] = msg
         tile = self._job_tiles.get(jid)
         if tile:
             tile.set_watch_status(msg, color)
@@ -5189,18 +6882,64 @@ class App(QMainWindow):
         job = self._jobs.get(job_id)
         if not job:
             return
-        # Mark these files done and restart the monitor immediately for next batch
         watcher = self._watch_watchers.get(job_id)
         if watcher:
             watcher.add_batched_paths(files)
-        folder_id   = job.get("drive_folder_id", "")
-        folder_name = job.get("drive_folder_name", "")
+        folder_id    = job.get("drive_folder_id", "")
+        folder_name  = job.get("drive_folder_name", "")
         watch_folder = job.get("watch_folder", "")
         folder_display = Path(watch_folder).name if watch_folder else "batch"
-        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # zip_name_hint is the subfolder name when in subfolder-zip mode; overrides zip_name field
-        custom   = zip_name_hint.strip() or job.get("zip_name", "").strip()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        action = decide_watch_action(
+            zip_=bool(job.get("zip", False)),
+            subfolders=bool(job.get("watch_recursive", False)),
+            keep_structure=bool(job.get("watch_keep_structure", True)),
+            zip_per_subfolder=bool(job.get("watch_subfolder_zip", False)),
+            root_individual=bool(job.get("watch_root_individual", False)),
+        )
+
+        # PER_SUBFOLDER_ZIP_LOOSE_ROOT: an empty hint means this is the loose
+        # root-level batch — upload each file individually, no zip created.
+        if action == WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT and not zip_name_hint.strip():
+            queued = 0
+            for p in files:
+                try:
+                    fsize = os.path.getsize(p)
+                except OSError:
+                    continue
+                e = UploadEntry.new(p, fsize, folder_id, folder_name)
+                e.job_id = job_id
+                if self._state.add(e):
+                    queued += 1
+                    tl = self._job_tiles.get(job_id)
+                    if tl:
+                        tl.add_file(e)
+            if queued:
+                self._start_next_uploads()
+            return
+
+        # zip_name_hint for PER_SUBFOLDER_ZIP is the FULL subfolder path (from _on_sf_stable).
+        # For other actions it is empty.
+        if action in (WatchAction.PER_SUBFOLDER_ZIP,
+                      WatchAction.PER_SUBFOLDER_ZIP_LOOSE_ROOT):
+            sf_path      = zip_name_hint.strip()
+            sf_name      = Path(sf_path).name if sf_path else ""
+            custom       = sf_name
+            keep_structure = True
+            base_path    = sf_path
+        elif action == WatchAction.SINGLE_ZIP_STRUCTURED:
+            custom       = job.get("zip_name", "").strip()
+            keep_structure = True
+            base_path    = watch_folder
+        else:
+            # SINGLE_ZIP_FLAT, SINGLE_ZIP_ROOT_ONLY — flat arcnames
+            custom       = job.get("zip_name", "").strip()
+            keep_structure = False
+            base_path    = ""
+
         zip_name = (custom if custom.lower().endswith(".zip") else custom + ".zip") if custom else f"{folder_display}_{ts}.zip"
+
         entry = UploadEntry.new(local_path="", file_size=0,
                                 folder_id=folder_id, folder_name=folder_name,
                                 status="compressing")
@@ -5216,7 +6955,10 @@ class App(QMainWindow):
         worker = ListZipWorker(files, zip_name, entry.id, self._state,
                                self._progress_queue, stop_event=stop_event,
                                keep_zip=job.get("keep_zip", False),
-                               output_dir=out_dir)
+                               output_dir=out_dir,
+                               keep_structure=keep_structure,
+                               base_path=base_path,
+                               scratch_dirs=self._cfg.get("zip_scratch_dirs", []))
         t = threading.Thread(target=worker.run, daemon=True)
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
@@ -5279,24 +7021,25 @@ class App(QMainWindow):
         job = self._jobs.get(job_id)
         if not job:
             return
-        dlg = WatchEditDialog(job, app=self, parent=self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        self._creation_panel.enter_watch_edit_mode(job_id, job)
+
+    def _on_watch_job_edited(self, job_id: str, spec: dict):
+        job = self._jobs.get(job_id)
+        if not job:
             return
-        params = dlg.result_params()
-        job.update(params)
-        # Update job name to reflect new watch folder
+        job.update(spec)
         job["name"] = f"Watch · {Path(job['watch_folder']).name}"
         self._save_jobs()
-        # Restart watcher with new params
-        watcher = self._watch_watchers.pop(job_id, None)
-        if watcher:
-            watcher.stop()
+        w = self._watch_watchers.pop(job_id, None)
+        if w:
+            w.stop()
         self._start_job_watcher(job)
         tile = self._job_tiles.get(job_id)
         if tile:
             tile._name_lbl.setText(job["name"])
             tile.set_watch_resumed()
             tile.set_watch_status("Watching…", TEAL)
+            tile.refresh_badges(job)
 
     def _stop_watch_job(self, job_id: str):
         watcher = self._watch_watchers.pop(job_id, None)
@@ -5345,18 +7088,31 @@ class App(QMainWindow):
         self._queue_panel.remove_tile(job_id)
         self._job_tiles.pop(job_id, None)
         self._jobs.pop(job_id, None)
+        self._email_gc()
         self._save_jobs()
 
     def _edit_job_email(self, job_id: str):
         job = self._jobs.get(job_id)
         if not job:
             return
-        dlg = EmailDraftDialog(self, job.get("email_cfg"), cfg=self._cfg)
+        dlg = EmailDraftDialog(self, job.get("email_cfg"), cfg=self._cfg,
+                               mode=("watch" if job.get("source") == "watch" else "manual"))
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_draft:
+            new_timing = dlg.result_draft.get("timing")
+            if new_timing != "after_queue_file":
+                prev = job.pop("email_after_entry_id", None)
+                if prev:
+                    tile = self._job_tiles.get(job_id)
+                    if tile:
+                        prow = tile.get_file_row(prev)
+                        if prow is not None:
+                            prow.mark_email_after(False)
             job["email_cfg"] = dlg.result_draft
+            self._save_jobs()
             tile = self._job_tiles.get(job_id)
             if tile:
                 tile._refresh_email_btn_style(job["email_cfg"])
+                tile.refresh_badges(job)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -5452,9 +7208,13 @@ class App(QMainWindow):
     # ── Progress polling ───────────────────────────────────────────────────────
 
     def _poll_progress(self):
-        try:
-            while True:
-                msg      = self._progress_queue.get_nowait()
+        import traceback as _ptb
+        while True:
+            try:
+                msg = self._progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
                 kind     = msg[0]
                 entry_id = msg[1]
 
@@ -5476,6 +7236,11 @@ class App(QMainWindow):
                     self._start_next_uploads()
                 elif kind == "zip_progress":
                     self._call_file_row(entry_id, "set_zip_progress", msg[2], msg[3])
+                elif kind == "zip_relocating":
+                    vol_label = msg[2]
+                    self._call_file_row(entry_id, "set_status",
+                                        f"Out of space, finishing on {vol_label}…")
+                    self._log(f"Zip out of space on current drive, relocating to {vol_label}")
                 elif kind == "zip_done":
                     self._active_zip_workers.pop(entry_id, None)
                     _, zip_size, zip_name = msg[2], msg[3], msg[4]
@@ -5510,8 +7275,8 @@ class App(QMainWindow):
                     for f_entry in f_entries:
                         if self._state.add(f_entry):
                             added += 1
-                        if f_tile:
-                            f_tile.add_file(f_entry)
+                            if f_tile:
+                                f_tile.add_file(f_entry)
                     if f_tile and f_root_id:
                         f_tile.set_folder_drive_id(f_root_id, f_fname)
                     self._log(f"Folder queued: {added} files added, {len(f_skipped)} skipped")
@@ -5523,6 +7288,13 @@ class App(QMainWindow):
                     self._start_next_uploads()
                 elif kind == "folder_structure_error":
                     self._show_notice(f"Failed to create folder structure in Drive:\n{msg[2]}")
+                elif kind == "repo_hidden_warning":
+                    self._show_notice(
+                        f"'{msg[2]}' looks like a code repository.\n\n"
+                        "Ignore Hidden Files is ON — .git, .github, .env and other "
+                        "dotfiles will be skipped.\n\n"
+                        "Turn off Ignore Hidden Files or upload as a zip to preserve everything."
+                    )
                 elif kind == "email_sent":
                     tile = self._job_tiles.get(msg[1])
                     if tile:
@@ -5531,8 +7303,37 @@ class App(QMainWindow):
                     tile = self._job_tiles.get(msg[1])
                     if tile:
                         tile.set_email_status("failed")
-        except queue.Empty:
-            pass
+                elif kind == "watch_subfolder_file_ready":
+                    w_job_id    = msg[1]
+                    w_path      = msg[2]
+                    w_size      = msg[3]
+                    w_drv_id    = msg[4]
+                    w_drv_name  = msg[5]
+                    w_local_dir = msg[6]
+                    w_job = self._jobs.get(w_job_id)
+                    if w_job:
+                        watch_folder = w_job.get("watch_folder", "")
+                        try:
+                            group_name = str(Path(w_local_dir).relative_to(watch_folder))
+                        except ValueError:
+                            group_name = Path(w_local_dir).name
+                        w_entry = UploadEntry.new(w_path, w_size, w_drv_id, w_drv_name,
+                                                   group_id=w_local_dir or None,
+                                                   group_name=group_name or None)
+                        w_entry.job_id = w_job_id
+                        if self._state.add(w_entry):
+                            self._log(
+                                f"Watch detected (subfolder): {Path(w_path).name}"
+                                f"  ({_fmt_size(w_size)})")
+                            w_tile = self._job_tiles.get(w_job_id)
+                            if w_tile:
+                                w_tile.add_file(w_entry)
+                            self._start_next_uploads()
+            except Exception as _poll_exc:
+                self._log(
+                    f"Progress message failed [{msg[0] if msg else '?'}]: "
+                    f"{_poll_exc}\n{_ptb.format_exc()}"
+                )
         n_uploading = len(self._active_workers)
         self._queue_panel.update_active_count(n_uploading)
 
@@ -5578,14 +7379,7 @@ class App(QMainWindow):
                 if tile:
                     tile.set_watch_status(f"●  Watching  •  {folder_name}", "green")
         if drive_file_id and entry and entry.job_id:
-            job = self._jobs.get(entry.job_id)
-            if job and job.get("email_cfg"):
-                email_cfg = job["email_cfg"]
-                if not email_cfg.get("held"):
-                    threading.Thread(
-                        target=self._send_job_email_background,
-                        args=(entry.job_id, entry, drive_file_id, upload_account),
-                        daemon=True).start()
+            self._email_on_file_done(entry, drive_file_id, upload_account)
         self._start_next_uploads()
 
     def _on_upload_error(self, entry_id: str, error_msg: str):
@@ -5597,6 +7391,263 @@ class App(QMainWindow):
         self._start_next_uploads()
 
     # ── Email ──────────────────────────────────────────────────────────────────
+
+    # ── Email batching / send timing ────────────────────────────────────────
+
+    def _set_email_after_entry(self, entry_id: str):
+        target = None
+        for jid, job in self._jobs.items():
+            tile = self._job_tiles.get(jid)
+            if tile and tile.get_file_row(entry_id) is not None:
+                target = job
+                break
+        if not target:
+            return
+        tile = self._job_tiles.get(target["id"])
+        prev = target.get("email_after_entry_id")
+        if prev and tile:
+            prow = tile.get_file_row(prev)
+            if prow is not None:
+                prow.mark_email_after(False)
+        target["email_after_entry_id"] = entry_id
+        if tile:
+            row = tile.get_file_row(entry_id)
+            if row is not None:
+                row.mark_email_after(True)
+        self._save_jobs()
+        self._log("Email will send after the selected file uploads.")
+
+    def _email_resolve_timing(self, job: dict, email_cfg: dict) -> str:
+        timing = email_cfg.get("timing") or "auto"
+        if timing != "auto":
+            return timing
+        if job.get("source", "manual") == "manual":
+            return "finish"
+        if job.get("watch_subfolder_zip"):
+            return "per_subfolder"
+        if job.get("zip"):
+            return "per_file"      # one combined zip = a single file
+        return "drop_finished"
+
+    def _email_key_and_meta(self, job: dict, entry, timing: str):
+        email_cfg = job.get("email_cfg") or {}
+        jid = job["id"]
+        if timing == "per_subfolder":
+            gval = getattr(entry, "folder_id", "") or ""
+            return (f"{jid}::sf::{gval}",
+                    {"job_id": jid, "timing": timing, "gkind": "sf", "gval": gval})
+        if job.get("source") == "manual" and email_cfg.get("scope") == "per_folder":
+            gval = (getattr(entry, "group_id", None)
+                    or getattr(entry, "folder_id", "") or "")
+            return (f"{jid}::g::{gval}",
+                    {"job_id": jid, "timing": timing, "gkind": "g", "gval": gval})
+        return ((job.get("batch_id") or jid),
+                {"job_id": jid, "timing": timing, "gkind": None, "gval": None})
+
+    def _email_on_file_done(self, entry, drive_file_id, upload_account):
+        job = self._jobs.get(entry.job_id)
+        if not job or not job.get("email_cfg"):
+            return
+        email_cfg = job["email_cfg"]
+        if email_cfg.get("held"):
+            return
+        timing = self._email_resolve_timing(job, email_cfg)
+        rec = {"file_name":   entry.file_name,
+               "drive_file_id": drive_file_id,
+               "folder_id":   getattr(entry, "folder_id", "") or job.get("drive_folder_id", ""),
+               "folder_name": getattr(entry, "folder_name", "") or job.get("drive_folder_name", ""),
+               "account":     upload_account,
+               "job_id":      entry.job_id}
+        # Explicit "send after this file" marker beats every timing rule.
+        sentinel = job.get("email_after_entry_id")
+        if timing == "per_file":
+            self._email_dispatch(job["id"], [rec])
+            return
+        key, meta = self._email_key_and_meta(job, entry, timing)
+        self._email_batch.setdefault(key, []).append(rec)
+        self._email_batch_meta[key] = meta
+        if sentinel and getattr(entry, "id", None) == sentinel:
+            job.pop("email_after_entry_id", None)
+            self._email_flush(key)
+            return
+        decision = email_trigger_decision(
+            timing, len(self._email_batch[key]),
+            int(email_cfg.get("count_n", 25) or 25),
+            self._email_batch_has_pending(key))
+        if decision == "send_batch":
+            self._email_flush(key)
+        elif decision == "arm_quiet":
+            self._email_arm_quiet(key, float(email_cfg.get("quiet_minutes", 5) or 5))
+        elif decision == "arm_schedule":
+            self._email_arm_schedule(key, float(email_cfg.get("schedule_minutes", 60) or 60))
+        elif decision == "arm_settle":
+            self._email_arm_settle(key, float(email_cfg.get("settle_secs", 60) or 60))
+        # "wait": a later file, the count threshold, or a fired timer will send it.
+
+    def _email_batch_has_pending(self, key: str) -> bool:
+        meta = self._email_batch_meta.get(key, {})
+        job_id = meta.get("job_id")
+        gkind  = meta.get("gkind")
+        gval   = meta.get("gval")
+        nonterminal = ("queued", "in_progress", "compressing", "paused")
+        for e in self._state.all():
+            if e.job_id != job_id:
+                continue
+            if e.status not in nonterminal:
+                continue
+            if gkind == "sf" and (getattr(e, "folder_id", "") or "") != gval:
+                continue
+            if gkind == "g" and ((getattr(e, "group_id", None)
+                                   or getattr(e, "folder_id", "") or "") != gval):
+                continue
+            return True
+        return False
+
+    def _email_arm_quiet(self, key: str, minutes: float):
+        t = self._email_batch_timers.get(key)
+        if t is None:
+            t = QTimer(self)
+            t.timeout.connect(lambda k=key: self._email_quiet_fire(k))
+            self._email_batch_timers[key] = t
+        t.setSingleShot(True)
+        t.start(max(1, int(minutes * 60 * 1000)))  # restart each file = debounce
+
+    def _email_quiet_fire(self, key: str):
+        self._email_batch_timers.pop(key, None)
+        self._email_flush(key)
+
+    def _email_arm_settle(self, key: str, seconds: float):
+        t = self._email_batch_timers.get(key)
+        if t is None:
+            t = QTimer(self)
+            t.timeout.connect(lambda k=key: self._email_settle_fire(k))
+            self._email_batch_timers[key] = t
+        t.setSingleShot(True)
+        t.start(max(1, int(seconds * 1000)))  # restart each file = settle window
+
+    def _email_settle_fire(self, key: str):
+        # Only send if the job really is idle; otherwise a new file re-armed us.
+        if self._email_batch_has_pending(key):
+            return
+        self._email_batch_timers.pop(key, None)
+        self._email_flush(key)
+
+    def _email_arm_schedule(self, key: str, minutes: float):
+        if key in self._email_batch_timers:
+            return  # already on a schedule
+        t = QTimer(self)
+        t.setSingleShot(False)
+        t.timeout.connect(lambda k=key: self._email_flush(k))
+        self._email_batch_timers[key] = t
+        t.start(max(1, int(minutes * 60 * 1000)))
+
+    def _email_flush(self, key: str):
+        recs = self._email_batch.pop(key, [])
+        self._email_batch_meta.pop(key, None)
+        if not recs:
+            return
+        job = self._jobs.get(recs[0]["job_id"])
+        if job:
+            self._email_dispatch(job["id"], recs)
+
+    def _email_dispatch(self, job_id: str, recs: list):
+        threading.Thread(target=self._send_batch_email_background,
+                         args=(job_id, recs), daemon=True).start()
+
+    def _email_gc(self):
+        """Drop batches/timers for jobs that no longer exist."""
+        live = set(self._jobs.keys())
+        for store in (self._email_batch, self._email_batch_meta):
+            for key in list(store.keys()):
+                meta = self._email_batch_meta.get(key, {})
+                jid = meta.get("job_id") or key
+                if jid not in live:
+                    store.pop(key, None)
+        for key in list(self._email_batch_timers.keys()):
+            meta = self._email_batch_meta.get(key, {})
+            jid = meta.get("job_id") or key
+            if jid not in live:
+                t = self._email_batch_timers.pop(key, None)
+                if t:
+                    t.stop()
+
+    def _send_batch_email_background(self, job_id: str, recs: list):
+        job = self._jobs.get(job_id)
+        if not job or not job.get("email_cfg") or not recs:
+            return
+        email_cfg = job["email_cfg"]
+        to = email_cfg.get("to", "").strip()
+        if not to:
+            return
+        account_id = (recs[0].get("account")
+                      or job.get("drive_account_id", "")
+                      or self._cfg.get("active_drive_account_id", ""))
+        share_link = bool(job.get("share_link"))
+        try:
+            svc = drive_accounts.build_thread_service(account_id)
+            links = []
+            for r in recs:
+                fid = r.get("drive_file_id")
+                if not fid:
+                    continue
+                if share_link:
+                    try:
+                        svc.permissions().create(
+                            fileId=fid,
+                            body={"role": "reader", "type": "anyone"},
+                            fields="id", supportsAllDrives=True).execute()
+                    except Exception:
+                        pass
+                res = svc.files().get(fileId=fid, fields="webViewLink",
+                                      supportsAllDrives=True).execute()
+                links.append((r.get("file_name", ""), res.get("webViewLink", "")))
+        except Exception as e:
+            self._progress_queue.put(("email_failed", job_id, str(e)))
+            return
+        if not links:
+            return
+        prof = sender_profile.load(account_id)
+        if not prof or not prof.get("gmail_app_password"):
+            self._progress_queue.put(("email_failed", job_id, "Sender not configured"))
+            return
+        first_name, first_link = links[0]
+        file_list   = "\n".join(f"{n}: {l}" for n, l in links)
+        folder_id   = recs[0].get("folder_id", "") or job.get("drive_folder_id", "")
+        folder_name = recs[0].get("folder_name", "") or job.get("drive_folder_name", "")
+        folder_link = (f"https://drive.google.com/drive/folders/{folder_id}"
+                       if folder_id else "")
+        safe = defaultdict(lambda: "?", {
+            "filename":    first_name,
+            "link":        first_link,
+            "file_list":   file_list,
+            "count":       str(len(links)),
+            "folder_link": folder_link,
+            "folder_name": folder_name,
+            "date":        _date.today().strftime("%B %d, %Y"),
+            "sender_name": prof.get("sender_name", ""),
+        })
+        raw = email_cfg.get("body", EmailTemplateDialog.DEFAULT_BODY)
+        if len(links) > 1 and "{file_list}" not in raw and "{folder_link}" not in raw:
+            raw = raw + "\n\nAll files:\n{file_list}"
+        subject = email_cfg.get("subject", EmailTemplateDialog.DEFAULT_SUBJECT
+                                ).format_map(safe)
+        body = (raw.replace("{link}", first_link)
+                   .replace("{file_list}", file_list)
+                   .replace("{folder_link}", folder_link)
+                   .format_map(safe))
+        try:
+            mailer.send(
+                sender_email=prof["sender_email"],
+                app_password=prof["gmail_app_password"],
+                recipient=to, subject=subject, body=body,
+                cc=email_cfg.get("cc", ""),
+                bcc=email_cfg.get("bcc", ""),
+            )
+            self._log(f"Email sent: {len(links)} file(s) → {to}")
+            self._progress_queue.put(("email_sent", job_id))
+        except Exception as e:
+            self._log(f"Email failed: {e}")
+            self._progress_queue.put(("email_failed", job_id, str(e)))
 
     def _send_job_email_background(self, job_id: str, entry, drive_file_id: str,
                                    upload_account_id: str | None):
@@ -5669,6 +7720,7 @@ class App(QMainWindow):
         for jid in to_remove:
             self._job_tiles.pop(jid, None)
             self._jobs.pop(jid, None)
+        self._email_gc()
 
     # ── Startup state ──────────────────────────────────────────────────────────
 
@@ -5842,29 +7894,166 @@ class App(QMainWindow):
         except OSError:
             pass
 
+    # ── Menu bar tray ──────────────────────────────────────────────────────────
+
+    def _setup_tray(self):
+        if not _HAS_TRAY:
+            return
+        bar = NSStatusBar.systemStatusBar()
+        self._ns_status_item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+
+        # SF Symbol arrow icon as a template image (auto dark/light)
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "arrow.up.circle", "Uplift")
+        if img is not None:
+            img.setTemplate_(True)
+            self._ns_status_item.button().setImage_(img)
+        self._ns_status_item.button().setToolTip_("Uplift — Drive Uploader")
+
+        self._tray_target = _TrayTarget.alloc().init()
+        self._tray_target.set_app(self)
+
+        self._ns_menu = NSMenu.alloc().init()
+        self._ns_menu.setDelegate_(self._tray_target)
+        self._ns_status_item.setMenu_(self._ns_menu)
+        self._rebuild_ns_menu()
+
+    def _rebuild_ns_menu(self):
+        if not hasattr(self, "_ns_menu"):
+            return
+        menu = self._ns_menu
+        menu.removeAllItems()
+
+        def _item(title: str, action: str | None = None,
+                  indent: int = 0, bold: bool = False) -> NSMenuItem:
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, action or "", "")
+            if action:
+                it.setTarget_(self._tray_target)
+            else:
+                it.setEnabled_(False)
+            if indent:
+                it.setIndentationLevel_(indent)
+            menu.addItem_(it)
+            return it
+
+        def _sep():
+            menu.addItem_(NSMenuItem.separatorItem())
+
+        _item("Uplift")
+        _sep()
+
+        # Upload / compression status
+        n_up  = len(self._active_workers)
+        n_zip = len(self._active_zip_workers)
+        if n_up or n_zip:
+            parts = []
+            if n_up:  parts.append(f"↑ {n_up} uploading")
+            if n_zip: parts.append(f"⏳ {n_zip} compressing")
+            _item(", ".join(parts))
+        else:
+            _item("Idle")
+
+        # Active watch jobs
+        active_watches = [
+            (jid, job) for jid, job in self._jobs.items()
+            if job.get("source") == "watch" and jid in self._watch_watchers
+        ]
+        if active_watches:
+            _sep()
+            _item("Watching:")
+            for jid, job in active_watches:
+                raw_name = job.get("name", "Watch")
+                # "Watch · HH:MM · FolderName"  →  "FolderName"
+                parts = raw_name.split(" · ")
+                name = parts[-1] if len(parts) >= 3 else raw_name
+                status = self._watch_status_text.get(jid, "Watching…")
+                # Strip leading bullet + spaces from status messages like "●  Timeline…"
+                status = status.lstrip("● ").strip()
+                _item(f"{name}  —  {status}", indent=1)
+
+        _sep()
+        _item("Show Window", action="showWindow:")
+        _sep()
+        _item("Quit Uplift", action="realQuit:")
+
+    def _tray_show_window(self):
+        if _HAS_TRAY:
+            try:
+                _NSApplication.sharedApplication().setActivationPolicy_(_NSPolicyRegular)
+            except Exception:
+                pass
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _hide_to_tray(self):
+        self.hide()
+        if _HAS_TRAY:
+            try:
+                _NSApplication.sharedApplication().setActivationPolicy_(_NSPolicyAccessory)
+            except Exception:
+                pass
+
+    def _real_quit(self):
+        self._is_quitting = True
+        if not self.isVisible():
+            active = len(self._active_workers) + len(self._active_zip_workers)
+            watching = len(self._watch_watchers)
+            if active or watching:
+                # Show window so the warning dialog can appear, then trigger close
+                self._tray_show_window()
+                self.close()
+            else:
+                # Nothing active — terminate directly without a dialog
+                self._terminate_now()
+            return
+        self.close()
+
+    # ── Window lifecycle ────────────────────────────────────────────────────────
+
+    def _terminate_now(self):
+        """Single authoritative shutdown: save, stop workers/watchers, exit event loop."""
+        self._is_quitting = True
+        self._save_jobs()
+        for job_id in list(self._watch_watchers):
+            self._stop_job_watcher(job_id)
+        for _, (_, stop_event) in list(self._active_workers.items()):
+            stop_event.set()
+        for _, (_, stop_event) in list(self._active_zip_workers.items()):
+            stop_event.set()
+        QApplication.instance().quit()
+
     def closeEvent(self, event):
+        if not self._is_quitting:
+            # Cmd+W or title-bar × — hide to tray, keep running
+            event.ignore()
+            self._hide_to_tray()
+            return
+        # Actual quit path (from _real_quit or menu → Quit Uplift)
         active = len(self._active_workers) + len(self._active_zip_workers)
+        watching = len(self._watch_watchers)
+        warning_parts = []
+        if watching:
+            warning_parts.append(f"{watching} watch folder{'s' if watching != 1 else ''} active")
         if active:
+            warning_parts.append(f"{active} upload{'s' if active != 1 else ''} in progress")
+        if warning_parts:
             msg = QMessageBox(self)
             msg.setWindowTitle("Quit Uplift?")
             msg.setText(
-                f"{active} upload{'s' if active != 1 else ''} in progress.\n"
-                "Quitting now will cancel them.")
+                ", ".join(warning_parts) + ".\n"
+                "Quitting now will stop them.")
             msg.setStandardButtons(
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
             msg.setDefaultButton(QMessageBox.StandardButton.Cancel)
             msg.button(QMessageBox.StandardButton.Yes).setText("Quit Anyway")
             if msg.exec() != QMessageBox.StandardButton.Yes:
+                self._is_quitting = False
                 event.ignore()
                 return
-        self._save_jobs()
-        for job_id in list(self._watch_watchers):
-            self._stop_job_watcher(job_id)
-        for _, (thread, stop_event) in list(self._active_workers.items()):
-            stop_event.set()
-        for _, (thread, stop_event) in list(self._active_zip_workers.items()):
-            stop_event.set()
         event.accept()
+        self._terminate_now()
 
 
 # ── macOS menu bar name fix ────────────────────────────────────────────────────
@@ -5918,20 +8107,97 @@ def _force_light_palette(app: QApplication) -> None:
     app.setPalette(p)
 
 
+class _QuitInterceptor(QObject):
+    """Intercepts QEvent::Quit (macOS Cmd+Q) to implement tap-vs-hold:
+    - Tap Cmd+Q  → hide to tray (single QEvent::Quit, no key-repeat follows).
+    - Hold Cmd+Q → Key_Q+Meta auto-repeat arrives while the tap timer is pending
+                   → treat as hold → _terminate_now().
+    - Tray Quit / _real_quit sets _is_quitting=True before triggering close, so
+      QEvent::Quit passes through unfiltered and the process exits normally.
+    """
+    _HOLD_MS = 500
+
+    def __init__(self, main_window: "App"):
+        super().__init__()
+        self._w = main_window
+        self._tap_timer: QTimer | None = None
+
+    def _cancel_tap_timer(self):
+        if self._tap_timer is not None:
+            self._tap_timer.stop()
+            self._tap_timer = None
+
+    def eventFilter(self, watched, event):
+        if self._w._is_quitting:
+            return False  # let it through — _real_quit already in progress
+
+        etype = event.type()
+
+        if etype == QEvent.Type.Quit:
+            # First Quit event: hide to tray, start hold-detection window.
+            # If a Key_Q auto-repeat arrives within _HOLD_MS, we treat it as hold.
+            if self._tap_timer is None:
+                t = QTimer()
+                t.setSingleShot(True)
+                t.timeout.connect(self._cancel_tap_timer)
+                t.start(self._HOLD_MS)
+                self._tap_timer = t
+                self._w._hide_to_tray()
+            return True  # swallow
+
+        if (etype == QEvent.Type.KeyPress and self._tap_timer is not None):
+            from PyQt6.QtGui import QKeyEvent as _QKE
+            ke = event
+            if (ke.key() == Qt.Key.Key_Q
+                    and ke.modifiers() & Qt.KeyboardModifier.MetaModifier
+                    and ke.isAutoRepeat()):
+                # Hold confirmed — cancel tap window and terminate
+                self._cancel_tap_timer()
+                self._w._terminate_now()
+                return True
+
+        return False
+
+
 if __name__ == "__main__":
     _fix_macos_app_name("Uplift")
     import sys
+    import traceback as _crash_tb
+
+    def _write_crash(msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with CRASH_LOG_PATH.open("a", encoding="utf-8") as _fh:
+                _fh.write(f"\n[{ts}] {msg}\n")
+        except OSError:
+            pass
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        msg = "".join(_crash_tb.format_exception(exc_type, exc_value, exc_tb))
+        _write_crash(f"UNCAUGHT EXCEPTION:\n{msg}")
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    def _threading_excepthook(args):
+        msg = "".join(_crash_tb.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback))
+        _write_crash(
+            f"UNCAUGHT THREAD EXCEPTION (thread={getattr(args, 'thread', '?')}):\n{msg}")
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _threading_excepthook
+
     app = QApplication(sys.argv)
     app.setApplicationName("Uplift")
     app.setApplicationDisplayName("Uplift")
-    app.setQuitOnLastWindowClosed(False)  # keep tray alive when window closed
+    app.setQuitOnLastWindowClosed(False)
     try:
         from AppKit import NSApplication, NSApplicationActivationPolicyRegular
         NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyRegular)
     except Exception:
         pass
     window = App()
-
+    _quit_interceptor = _QuitInterceptor(window)
+    app.installEventFilter(_quit_interceptor)
     window.show()
 
     sys.exit(app.exec())

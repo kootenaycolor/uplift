@@ -7,6 +7,11 @@ dist/
 build/
 *.spec
 launcher_stub.c
+!dist/*.dmg
+
+# Backup files from dev sessions
+main_before_*.py
+config_before_*.py
 
 # Python cache
 __pycache__/
