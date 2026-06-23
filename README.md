@@ -6,10 +6,9 @@ A native macOS app for uploading files and folders to Google Drive — built for
 
 ## Download
 
-Grab the latest build from [`dist/Uplift.dmg`](dist/Uplift.dmg) — open, drag to Applications, launch.
+Grab the latest build from the [Releases page](https://github.com/CanadianWiteout/uplift/releases/latest) — open the DMG, drag to Applications, launch.
 
-> Requires Python 3.14 installed at `/Library/Frameworks/Python.framework/Versions/3.14`
-> ([python.org/downloads](https://www.python.org/downloads/))
+No dependencies required. Python is bundled inside the app.
 
 ---
 
@@ -113,9 +112,11 @@ Send a Gmail share link on upload completion. Triggered per job or per folder.
 
 ### Option A — DMG (recommended)
 
-1. Download [`dist/Uplift.dmg`](dist/Uplift.dmg)
+1. Download from [Releases](https://github.com/CanadianWiteout/uplift/releases/latest)
 2. Open the DMG, drag **Uplift** to **Applications**
 3. Launch from Applications or Spotlight
+
+No dependencies. Python is bundled inside the app.
 
 ### Option B — Run from source
 
@@ -222,7 +223,6 @@ uplift/
 ├── theme_editor.py      # Visual theme editor (dev tool)
 ├── fonts/               # Bundled fonts
 ├── design/              # App icon source files
-├── dist/Uplift.dmg      # Latest release DMG
 ├── requirements.txt
 └── CLAUDE.md            # Design system reference
 ```
