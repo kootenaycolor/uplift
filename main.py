@@ -3272,14 +3272,6 @@ class EmailDraftDialog(QDialog):
 
         # ── Three independent preset bars ─────────────────────────────────────
         if cfg is not None:
-            self._body_combo = self._styled_combo()
-            self._refresh_body_combo()
-            self._body_combo.currentIndexChanged.connect(self._on_body_combo_changed)
-            self._add_preset_bar(lay, "Body template:", self._body_combo,
-                                 self._save_body_template,
-                                 self._rename_body_template,
-                                 self._delete_body_template)
-
             self._recip_combo = self._styled_combo()
             self._refresh_recip_combo()
             self._recip_combo.currentIndexChanged.connect(self._on_recip_combo_changed)
@@ -3287,6 +3279,14 @@ class EmailDraftDialog(QDialog):
                                  self._save_recip_preset,
                                  self._rename_recip_preset,
                                  self._delete_recip_preset)
+
+            self._body_combo = self._styled_combo()
+            self._refresh_body_combo()
+            self._body_combo.currentIndexChanged.connect(self._on_body_combo_changed)
+            self._add_preset_bar(lay, "Body template:", self._body_combo,
+                                 self._save_body_template,
+                                 self._rename_body_template,
+                                 self._delete_body_template)
 
             self._tpreset_combo = self._styled_combo()
             self._refresh_tpreset_combo()
@@ -3373,7 +3373,7 @@ class EmailDraftDialog(QDialog):
         self._timing_schedule = int(d.get("schedule_minutes", 60) or 60)
         self._timing_settle   = int(d.get("settle_secs", 60) or 60)
 
-        sec_lbl = QLabel("When to send")
+        sec_lbl = QLabel("Timing — When to Send")
         sec_lbl.setFont(F_LABEL(10))
         sec_lbl.setStyleSheet(f"color: {_th_stone()};")
         lay.addWidget(sec_lbl)
