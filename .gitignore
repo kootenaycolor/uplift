@@ -2,12 +2,11 @@
 credentials.json
 token.json
 
-# Build artifacts
+# Build artifacts — DMGs go to GitHub Releases, not the repo (>100 MB limit)
 dist/
 build/
 *.spec
 launcher_stub.c
-!dist/*.dmg
 
 # Backup files from dev sessions
 main_before_*.py
