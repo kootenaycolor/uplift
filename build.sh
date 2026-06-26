@@ -304,9 +304,6 @@ if [ "$MAKE_DMG" = "1" ]; then
     --exclude '*.pyc' \
     "$SP_SRC/" "$SP_DEST/"
 
-  # discovery_cache is 93 MB of JSON API schemas; fetched fresh at runtime
-  rm -rf "$SP_DEST/googleapiclient/discovery_cache"
-
   # Fix any absolute framework lib refs in site-packages .so files.
   # Compute the relative path from each .so's directory back up to lib/ so
   # @loader_path/<rel>/<dylib> resolves correctly regardless of nesting depth.
