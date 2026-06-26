@@ -2238,17 +2238,19 @@ class FolderPickerDialog(QDialog):
 
     _COL_W = 220
 
-    def __init__(self, parent, folders):
+    def __init__(self, parent, folders, acct_id: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Select Drive Folder")
         self.resize(740, 460)
         self.setModal(True)
         self.result_id   = None
         self.result_name = None
-        self._folders    = folders
+        self._folders    = list(folders)
+        self._acct_id    = acct_id
         self._selected: dict | None = None
         self._columns: list[QListWidget] = []
         self._searching  = False
+        self._active_drive_id: str = ""
 
         self._build_lookups()
         self._build_ui()
@@ -2311,6 +2313,11 @@ class FolderPickerDialog(QDialog):
 
         btn_row = QWidget()
         br = QHBoxLayout(btn_row); br.setContentsMargins(0, 4, 0, 0); br.setSpacing(8)
+        self._new_folder_btn = QPushButton("New Folder")
+        self._new_folder_btn.setObjectName("ghost")
+        self._new_folder_btn.setEnabled(False)
+        self._new_folder_btn.clicked.connect(self._new_folder)
+        br.addWidget(self._new_folder_btn)
         br.addStretch()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("ghost")
@@ -2399,13 +2406,17 @@ class FolderPickerDialog(QDialog):
                 return
             if folder.get("_is_drive"):
                 self._selected = None
+                self._active_drive_id = folder["id"]
                 self._select_btn.setEnabled(False)
+                self._new_folder_btn.setEnabled(bool(self._acct_id))
                 self._breadcrumb.setText(folder.get("drive_name", ""))
                 self._push_folder_column(
                     self._children.get(folder["id"], []), col_idx)
             else:
                 self._selected = folder
+                self._active_drive_id = folder.get("drive_id", "")
                 self._select_btn.setEnabled(True)
+                self._new_folder_btn.setEnabled(bool(self._acct_id))
                 self._update_breadcrumb(folder)
                 self._push_folder_column(
                     self._children.get(folder["id"], []), col_idx)
@@ -2424,6 +2435,7 @@ class FolderPickerDialog(QDialog):
             old.deleteLater()
         self._selected = None
         self._select_btn.setEnabled(False)
+        self._new_folder_btn.setEnabled(False)
 
         if not q:
             self._searching = False
@@ -2456,11 +2468,14 @@ class FolderPickerDialog(QDialog):
             if not current:
                 self._selected = None
                 self._select_btn.setEnabled(False)
+                self._new_folder_btn.setEnabled(False)
                 return
             folder = current.data(Qt.ItemDataRole.UserRole)
             self._selected = folder
             self._select_btn.setEnabled(folder is not None)
+            self._new_folder_btn.setEnabled(bool(folder and self._acct_id))
             if folder:
+                self._active_drive_id = folder.get("drive_id", "")
                 self._update_breadcrumb(folder)
                 children = self._children.get(folder["id"], [])
                 self._push_folder_column(children, 0)
@@ -2483,6 +2498,73 @@ class FolderPickerDialog(QDialog):
             cur = parent
         parts.insert(0, folder.get("drive_name", ""))
         self._breadcrumb.setText("  ›  ".join(p for p in parts if p))
+
+    # ── new folder ────────────────────────────────────────────────────────────
+
+    def _new_folder(self):
+        parent_id = self._selected["id"] if self._selected else self._active_drive_id
+        if not parent_id or not self._acct_id:
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "New Folder", "Folder name:", text="New Folder")
+        name = name.strip()
+        if not ok or not name:
+            return
+
+        self._new_folder_btn.setEnabled(False)
+        self._select_btn.setEnabled(False)
+        self._breadcrumb.setText("Creating folder…")
+        QApplication.processEvents()
+
+        try:
+            svc = drive_accounts.get_service(self._acct_id)
+            new_id = drivelib.create_drive_folder(svc, name, parent_id)
+        except Exception as exc:
+            self._new_folder_btn.setEnabled(True)
+            if self._selected:
+                self._select_btn.setEnabled(True)
+                self._update_breadcrumb(self._selected)
+            else:
+                self._breadcrumb.setText(" ")
+            QMessageBox.warning(self, "Create Failed", str(exc))
+            return
+
+        drive_id = self._active_drive_id
+        drive_name = next(
+            (n for did, n in self._drives if did == drive_id), "")
+        new_folder = {
+            "id": new_id,
+            "name": name,
+            "parent_id": parent_id,
+            "drive_id": drive_id,
+            "drive_name": drive_name,
+        }
+        self._folders.append(new_folder)
+        self._build_lookups()
+
+        # Select the new folder and refresh the current column
+        self._selected = new_folder
+        self._select_btn.setEnabled(True)
+        self._new_folder_btn.setEnabled(True)
+        self._update_breadcrumb(new_folder)
+
+        # Refresh column that now contains the new folder
+        parent_children = self._children.get(parent_id, [])
+        active_col = len(self._columns) - 1
+        current_lw = self._columns[active_col] if self._columns else None
+        if current_lw:
+            current_lw.clear()
+            for folder in parent_children:
+                arrow = "  ›" if self._has_children(folder["id"]) else ""
+                item = QListWidgetItem(f"📁  {folder['name']}{arrow}")
+                item.setData(Qt.ItemDataRole.UserRole, folder)
+                current_lw.addItem(item)
+            # Select the new folder row
+            for i in range(current_lw.count()):
+                if current_lw.item(i).data(Qt.ItemDataRole.UserRole).get("id") == new_id:
+                    current_lw.setCurrentRow(i)
+                    break
 
     # ── confirm / keys ────────────────────────────────────────────────────────
 
@@ -5395,7 +5477,9 @@ class JobCreationPanel(QFrame):
 
     def _show_folder_picker(self, which: str):
         try:
-            dlg = FolderPickerDialog(self, self._available_folders)
+            combo   = self._acct_combo_u if which == "u" else self._acct_combo_w
+            acct_id = self._get_acct_id(combo)
+            dlg = FolderPickerDialog(self, self._available_folders, acct_id=acct_id)
         except Exception:
             import traceback; traceback.print_exc()
             return
