@@ -10,8 +10,8 @@
 # The CFBundleExecutable is a compiled C binary (not a shell script) because
 # macOS 26 security policy blocks shell scripts as app executables.
 #
-#   bash build.sh          — fast dev build (requires system Python 3.14)
-#   bash build.sh --dmg    — portable DMG with bundled Python (no Python needed on target)
+#   bash build.sh          — fast dev build → installs as Uplift-dev.app
+#   bash build.sh --dmg    — portable DMG with bundled Python → installs as Uplift.app
 
 set -e
 
@@ -20,8 +20,14 @@ for arg in "$@"; do
   [ "$arg" = "--dmg" ] && MAKE_DMG=1
 done
 
-APP_NAME="Uplift"
-BUNDLE_ID="com.kootenaycolor.uplift"
+# Dev builds install as "Uplift-dev" so they coexist with the release app
+if [ "$MAKE_DMG" = "1" ]; then
+  APP_NAME="Uplift"
+  BUNDLE_ID="com.kootenaycolor.uplift"
+else
+  APP_NAME="Uplift-dev"
+  BUNDLE_ID="com.kootenaycolor.uplift-dev"
+fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DIST="$SCRIPT_DIR/dist/$APP_NAME.app"
 
