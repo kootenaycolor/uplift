@@ -6,7 +6,7 @@ A native macOS app for uploading files and folders to Google Drive — built for
 
 ## Download
 
-Grab the latest build from the [Releases page](https://github.com/CanadianWiteout/uplift/releases/latest) — open the DMG, drag to Applications, launch.
+Grab the latest build from the [Releases page](https://github.com/kootenaycolor/uplift/releases/latest) — open the DMG, drag to Applications, launch.
 
 No dependencies required. Python is bundled inside the app.
 
@@ -102,7 +102,8 @@ Send a Gmail share link on upload completion. Triggered per job or per folder.
 ## Requirements
 
 - macOS 12+
-- Python 3.14 (for the `.app` build) or Python 3.11+ (to run from source)
+- **DMG install**: no additional dependencies — Python is bundled inside the app
+- **Run from source**: Python 3.11+
 - A Google Cloud project with the Drive API enabled ([setup guide below](#google-drive-setup))
 - *(Email only)* A Gmail account with an [App Password](https://myaccount.google.com/apppasswords)
 
@@ -112,7 +113,7 @@ Send a Gmail share link on upload completion. Triggered per job or per folder.
 
 ### Option A — DMG (recommended)
 
-1. Download from [Releases](https://github.com/CanadianWiteout/uplift/releases/latest)
+1. Download from [Releases](https://github.com/kootenaycolor/uplift/releases/latest)
 2. Open the DMG, drag **Uplift** to **Applications**
 3. Launch from Applications or Spotlight
 
@@ -121,8 +122,8 @@ No dependencies. Python is bundled inside the app.
 ### Option B — Run from source
 
 ```bash
-git clone https://github.com/CanadianWiteout/drive-uploader.git
-cd drive-uploader
+git clone https://github.com/kootenaycolor/uplift.git
+cd uplift
 pip3 install -r requirements.txt
 python3 main.py
 ```
@@ -130,11 +131,14 @@ python3 main.py
 ### Option C — Build your own .app
 
 ```bash
+# Dev build (requires system Python 3.14)
 bash build.sh
-# Installs to /Applications/Uplift.app
+
+# Self-contained DMG with Python bundled (no Python needed on target machine)
+bash build.sh --dmg
 ```
 
-Requires Python 3.14 at `/Library/Frameworks/Python.framework/Versions/3.14`.
+Requires Python 3.14 at `/Library/Frameworks/Python.framework/Versions/3.14` on the build machine only.
 
 ---
 
@@ -231,4 +235,4 @@ uplift/
 
 ## Part of the Kootenay Color Toolset
 
-- [kc-project-creator](https://github.com/CanadianWiteout/kc-project-creator) — Project folder structure creator
+- [kc-project-creator](https://github.com/kootenaycolor/kc-project-creator) — Project folder structure creator
