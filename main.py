@@ -51,6 +51,23 @@ import sender_profile
 from drive import StopRequested
 from state import StateManager, UploadEntry
 
+# ── SSL certificate fix for bundled app ───────────────────────────────────────
+# certifi.where() may return a stale path when running from a DMG bundle.
+# Set SSL env vars early so requests/httplib2 find the certs before any
+# network call happens. Safe to do on system Python too — just no-ops there.
+def _fix_ssl_certs():
+    try:
+        import certifi
+        cert_path = certifi.where()
+        if not os.path.exists(cert_path):
+            cert_path = os.path.join(os.path.dirname(certifi.__file__), "cacert.pem")
+        if os.path.exists(cert_path):
+            os.environ.setdefault("SSL_CERT_FILE", cert_path)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", cert_path)
+    except Exception:
+        pass
+_fix_ssl_certs()
+
 # ── Design tokens ──────────────────────────────────────────────────────────────
 BG         = "#F1F0F0"
 SURFACE    = "#FFFFFF"
@@ -6316,6 +6333,7 @@ class App(QMainWindow):
         self._poll_timer.start()
 
         QTimer.singleShot(0, self._init_drive)
+        QTimer.singleShot(1000, self._prewarm_volume_access)
 
     def _build_ui(self):
         central = QWidget()
@@ -7058,6 +7076,21 @@ class App(QMainWindow):
         self._queue_panel.refresh_theme()
         for tile in self._job_tiles.values():
             tile.refresh_theme()
+
+    def _prewarm_volume_access(self):
+        """Scan /Volumes in a background thread to trigger macOS TCC prompts
+        at launch rather than mid-upload when the user may be away."""
+        def _scan():
+            try:
+                for vol in os.listdir("/Volumes"):
+                    vol_path = os.path.join("/Volumes", vol)
+                    try:
+                        os.listdir(vol_path)
+                    except PermissionError:
+                        pass
+            except Exception:
+                pass
+        threading.Thread(target=_scan, daemon=True).start()
 
     def _init_drive(self):
         accounts   = drive_accounts.list_accounts()
