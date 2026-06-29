@@ -6304,6 +6304,7 @@ class App(QMainWindow):
         self._progress_queue: queue.Queue = queue.Queue()
         self._active_workers: dict[str, tuple]     = {}
         self._active_zip_workers: dict[str, tuple] = {}
+        self._power_token = None  # NSProcessInfo activity token; held while any worker is active
         self._upload_account: dict[str, str]        = {}
 
         self._jobs: dict[str, dict]       = {}
@@ -6604,6 +6605,7 @@ class App(QMainWindow):
         t = threading.Thread(target=worker.run, daemon=True)
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
+        self._acquire_sleep_block()
 
     def _add_files_as_zip(self, files: list, job: dict):
         job_id      = job["id"]
@@ -6629,6 +6631,7 @@ class App(QMainWindow):
         t = threading.Thread(target=worker.run, daemon=True)
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
+        self._acquire_sleep_block()
 
     def _add_folder_as_zip(self, folder_path: str, job: dict):
         folder_name = Path(folder_path).name
@@ -6656,6 +6659,7 @@ class App(QMainWindow):
         t = threading.Thread(target=worker.run, daemon=True)
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
+        self._acquire_sleep_block()
 
     def _add_folder_as_structure(self, folder_path: str, job: dict):
         self._log(f"_add_folder_as_structure: {folder_path}")
@@ -7065,6 +7069,7 @@ class App(QMainWindow):
         t = threading.Thread(target=worker.run, daemon=True)
         self._active_zip_workers[entry.id] = (t, stop_event)
         t.start()
+        self._acquire_sleep_block()
 
     # ── Drive ──────────────────────────────────────────────────────────────────
 
@@ -7076,6 +7081,32 @@ class App(QMainWindow):
         self._queue_panel.refresh_theme()
         for tile in self._job_tiles.values():
             tile.refresh_theme()
+
+    def _acquire_sleep_block(self):
+        """Prevent idle system sleep while uploads are running. Display sleep still allowed."""
+        if self._power_token is not None:
+            return
+        try:
+            from AppKit import NSProcessInfo
+            # NSActivityIdleSystemSleepDisabled (1<<8) — blocks idle sleep, not display sleep
+            self._power_token = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+                1 << 8, "Uplift upload in progress")
+        except Exception:
+            pass
+
+    def _release_sleep_block(self):
+        """Release sleep prevention once all workers are done."""
+        if self._power_token is None:
+            return
+        if self._active_workers or self._active_zip_workers:
+            return
+        try:
+            from AppKit import NSProcessInfo
+            NSProcessInfo.processInfo().endActivity_(self._power_token)
+        except Exception:
+            pass
+        finally:
+            self._power_token = None
 
     def _prewarm_volume_access(self):
         """Scan /Volumes in a background thread to trigger macOS TCC prompts
@@ -7277,6 +7308,7 @@ class App(QMainWindow):
                 if row:
                     row.set_uploading()
             t.start()
+            self._acquire_sleep_block()
 
     def _cancel_upload(self, entry_id: str):
         if entry_id in self._active_zip_workers:
@@ -7352,6 +7384,7 @@ class App(QMainWindow):
                     self._on_upload_error(entry_id, msg[2])
                 elif kind == "cancelled":
                     self._active_workers.pop(entry_id, None)
+                    self._release_sleep_block()
                     self._call_file_row(entry_id, "set_paused")
                     self._start_next_uploads()
                 elif kind == "zip_progress":
@@ -7363,6 +7396,7 @@ class App(QMainWindow):
                     self._log(f"Zip out of space on current drive, relocating to {vol_label}")
                 elif kind == "zip_done":
                     self._active_zip_workers.pop(entry_id, None)
+                    self._release_sleep_block()
                     _, zip_size, zip_name = msg[2], msg[3], msg[4]
                     self._call_file_row(entry_id, "set_upload_ready", zip_name, zip_size)
                     self._log(f"Zip complete: {zip_name}  ({_fmt_size(zip_size)})")
@@ -7376,6 +7410,7 @@ class App(QMainWindow):
                     self._start_next_uploads()
                 elif kind == "zip_cancelled":
                     self._active_zip_workers.pop(entry_id, None)
+                    self._release_sleep_block()
                     self._call_file_row(entry_id, "set_failed", "Cancelled")
                 elif kind == "share_ok":
                     self._log(f"Public link set: drive.google.com/file/d/{msg[2]}/view")
@@ -7459,6 +7494,7 @@ class App(QMainWindow):
 
     def _on_upload_done(self, entry_id: str, drive_file_id: str):
         self._active_workers.pop(entry_id, None)
+        self._release_sleep_block()
         upload_account = self._upload_account.pop(entry_id, None)
         web_link = (f"https://drive.google.com/file/d/{drive_file_id}/view"
                     if drive_file_id else "")
@@ -7504,6 +7540,7 @@ class App(QMainWindow):
 
     def _on_upload_error(self, entry_id: str, error_msg: str):
         self._active_workers.pop(entry_id, None)
+        self._release_sleep_block()
         self._upload_account.pop(entry_id, None)
         entry = self._state.get(entry_id)
         self._call_file_row(entry_id, "set_failed", error_msg)
